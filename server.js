@@ -32,12 +32,25 @@ const client = twilio(
 let whatsappSocket = null;
 let isWhatsAppConnected = false;
 let qrCode = null;
+let connectionError = null;
+let isConnecting = false;
 
 // WhatsApp Message Handler - UPDATED WITH PROPER LOGGER
 async function connectToWhatsApp() {
+  if (isConnecting) {
+    console.log('⏳ WhatsApp connection already in progress...');
+    return;
+  }
+
+  isConnecting = true;
+  connectionError = null;
+
   try {
+    console.log('🔄 Initializing WhatsApp connection...');
     const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
     const { version } = await fetchLatestBaileysVersion();
+    
+    console.log(`📦 Using Baileys version: ${version.join('.')}`);
     
     // Create a proper logger that Baileys expects
     const logger = {
@@ -62,6 +75,8 @@ async function connectToWhatsApp() {
       browser: ['Baileys Bot', 'Chrome', '1.0.0'],
     });
 
+    isConnecting = false;
+
     // Handle connection updates
     whatsappSocket.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -75,19 +90,23 @@ async function connectToWhatsApp() {
       }
 
       if (connection === 'close') {
+        isWhatsAppConnected = false;
         const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
         
-        console.log(`⚠️ WhatsApp connection closed due to ${lastDisconnect?.error?.message || 'unknown reason'}, reconnecting ${shouldReconnect}`);
+        const errorMsg = lastDisconnect?.error?.message || 'unknown reason';
+        console.log(`⚠️ WhatsApp connection closed due to ${errorMsg}, reconnecting ${shouldReconnect}`);
         
         if (shouldReconnect) {
+          connectionError = errorMsg;
           setTimeout(() => connectToWhatsApp(), 5000);
         } else {
-          isWhatsAppConnected = false;
+          connectionError = 'Logged out - please scan QR code again';
           console.log('❌ WhatsApp logged out, please scan QR code again');
         }
       } else if (connection === 'open') {
         isWhatsAppConnected = true;
         qrCode = null;
+        connectionError = null;
         console.log('✅ WhatsApp connected successfully!');
       }
     });
@@ -119,6 +138,8 @@ async function connectToWhatsApp() {
     });
 
   } catch (error) {
+    isConnecting = false;
+    connectionError = error.message;
     console.error('❌ Error connecting to WhatsApp:', error);
     // Retry after 10 seconds
     setTimeout(() => connectToWhatsApp(), 10000);
@@ -217,40 +238,209 @@ async function sendWhatsAppMessage(jid, text) {
 
 // GET /whatsapp/qr - Get QR code for WhatsApp connection
 app.get('/whatsapp/qr', (req, res) => {
+  // Set timeout to prevent infinite loading
+  res.setTimeout(30000);
+
   if (isWhatsAppConnected) {
-    return res.json({
-      success: true,
-      status: 'connected',
-      message: 'WhatsApp is already connected'
-    });
+    return res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>WhatsApp Connected</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
+            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .success { color: #25d366; font-size: 48px; margin-bottom: 20px; }
+            h2 { color: #333; }
+            .status { background: #d4edda; color: #155724; padding: 15px; border-radius: 5px; margin-top: 20px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="success">✅</div>
+            <h2>WhatsApp Connected!</h2>
+            <p>Your WhatsApp is already connected and ready to send messages.</p>
+            <div class="status">Status: Active Connection</div>
+            <p style="margin-top: 30px; color: #666;">
+              <a href="/whatsapp/status" style="color: #25d366;">Check Status</a> | 
+              <a href="/" style="color: #25d366;">API Docs</a>
+            </p>
+          </div>
+        </body>
+      </html>
+    `);
+  }
+
+  if (connectionError) {
+    return res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>WhatsApp Connection Error</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
+            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .error { color: #dc3545; font-size: 48px; margin-bottom: 20px; }
+            .error-msg { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px; margin-top: 20px; }
+            button { background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 20px; }
+            button:hover { background: #128c7e; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="error">❌</div>
+            <h2>Connection Error</h2>
+            <p>There was a problem connecting to WhatsApp:</p>
+            <div class="error-msg">${connectionError}</div>
+            <button onclick="location.reload()">🔄 Retry Connection</button>
+            <p style="margin-top: 30px; color: #666;">
+              <a href="/whatsapp/status" style="color: #25d366;">Check Status</a>
+            </p>
+          </div>
+        </body>
+      </html>
+    `);
   }
 
   if (qrCode) {
     // Return QR code as SVG for web display
     qrcode.toString(qrCode, { type: 'svg' }, (err, svg) => {
       if (err) {
-        return res.status(500).json({
-          success: false,
-          error: 'Failed to generate QR code'
-        });
+        return res.status(500).send(`
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="UTF-8">
+              <title>QR Code Error</title>
+              <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
+                .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; }
+              </style>
+            </head>
+            <body>
+              <div class="container">
+                <h2>Failed to generate QR code</h2>
+                <p style="color: red;">${err.message}</p>
+                <button onclick="location.reload()" style="background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer;">Retry</button>
+              </div>
+            </body>
+          </html>
+        `);
       }
       
-      res.set('Content-Type', 'image/svg+xml');
       res.send(`
-        <div style="text-align: center; font-family: Arial, sans-serif;">
-          <h2>Scan WhatsApp QR Code</h2>
-          ${svg}
-          <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
-          <p>Status: Waiting for scan...</p>
-        </div>
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>WhatsApp QR Code</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background: #f0f2f5; }
+              .container { max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+              h2 { color: #333; margin-bottom: 10px; }
+              .qr-container { margin: 30px 0; padding: 20px; background: #f8f9fa; border-radius: 10px; }
+              .instructions { text-align: left; margin: 20px 0; padding: 20px; background: #e7f3ff; border-left: 4px solid #2196F3; border-radius: 5px; }
+              .instructions ol { margin: 10px 0; padding-left: 20px; }
+              .instructions li { margin: 8px 0; }
+              .status { display: inline-block; padding: 8px 16px; background: #fff3cd; color: #856404; border-radius: 20px; font-size: 14px; margin-top: 20px; }
+              .loading { display: inline-block; width: 12px; height: 12px; border: 2px solid #856404; border-radius: 50%; border-top-color: transparent; animation: spin 1s linear infinite; margin-left: 8px; }
+              @keyframes spin { to { transform: rotate(360deg); } }
+              .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #666; font-size: 14px; }
+              button { background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
+              button:hover { background: #128c7e; }
+            </style>
+            <script>
+              // Auto-refresh every 10 seconds to check connection status
+              let refreshCount = 0;
+              const maxRefreshes = 30; // Stop after 5 minutes (30 * 10s)
+              
+              setInterval(() => {
+                refreshCount++;
+                if (refreshCount < maxRefreshes) {
+                  fetch('/whatsapp/status')
+                    .then(r => r.json())
+                    .then(data => {
+                      if (data.connected) {
+                        location.reload();
+                      }
+                    });
+                }
+              }, 10000);
+            </script>
+          </head>
+          <body>
+            <div class="container">
+              <h2>📱 Scan WhatsApp QR Code</h2>
+              <p style="color: #666;">Connect your WhatsApp account to start sending messages</p>
+              
+              <div class="qr-container">
+                ${svg}
+              </div>
+              
+              <div class="instructions">
+                <strong>How to connect:</strong>
+                <ol>
+                  <li>Open <strong>WhatsApp</strong> on your phone</li>
+                  <li>Tap <strong>Menu</strong> (⋮) or <strong>Settings</strong></li>
+                  <li>Select <strong>Linked Devices</strong></li>
+                  <li>Tap <strong>Link a Device</strong></li>
+                  <li>Point your phone at this screen to scan the code</li>
+                </ol>
+              </div>
+              
+              <div class="status">
+                ⏳ Waiting for scan<span class="loading"></span>
+              </div>
+              
+              <div>
+                <button onclick="location.reload()">🔄 Refresh QR Code</button>
+              </div>
+              
+              <div class="footer">
+                This page will automatically update when connected<br>
+                <a href="/whatsapp/status" style="color: #25d366;">Check Connection Status</a>
+              </div>
+            </div>
+          </body>
+        </html>
       `);
     });
   } else {
-    res.json({
-      success: false,
-      status: 'initializing',
-      message: 'QR code not generated yet, please try again in a few seconds'
-    });
+    // QR code not yet generated
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <meta http-equiv="refresh" content="3">
+          <title>Initializing WhatsApp</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
+            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .spinner { width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #25d366; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px auto; }
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            .status { background: #fff3cd; color: #856404; padding: 15px; border-radius: 5px; margin-top: 20px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="spinner"></div>
+            <h2>Initializing WhatsApp Connection</h2>
+            <p>Please wait while we generate your QR code...</p>
+            <div class="status">
+              ${isConnecting ? 'Connecting to WhatsApp servers...' : 'Starting connection process...'}
+            </div>
+            <p style="margin-top: 20px; color: #666; font-size: 14px;">This page will refresh automatically</p>
+          </div>
+        </body>
+      </html>
+    `);
   }
 });
 
@@ -301,9 +491,49 @@ app.get('/whatsapp/status', (req, res) => {
   res.json({
     success: true,
     connected: isWhatsAppConnected,
-    status: isWhatsAppConnected ? 'connected' : 'disconnected',
-    qrAvailable: !!qrCode
+    status: isWhatsAppConnected ? 'connected' : (isConnecting ? 'connecting' : 'disconnected'),
+    qrAvailable: !!qrCode,
+    error: connectionError,
+    timestamp: new Date().toISOString()
   });
+});
+
+// POST /whatsapp/reconnect - Manually trigger WhatsApp reconnection
+app.post('/whatsapp/reconnect', async (req, res) => {
+  console.log('🔄 Manual reconnection requested');
+  
+  if (isWhatsAppConnected) {
+    return res.json({
+      success: true,
+      message: 'WhatsApp is already connected'
+    });
+  }
+
+  if (isConnecting) {
+    return res.json({
+      success: false,
+      message: 'Connection already in progress, please wait...'
+    });
+  }
+
+  try {
+    // Reset state
+    qrCode = null;
+    connectionError = null;
+    
+    // Trigger connection
+    connectToWhatsApp();
+    
+    res.json({
+      success: true,
+      message: 'WhatsApp reconnection initiated. Check /whatsapp/qr for QR code.'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 // ========== EXISTING TWILIO ENDPOINTS ==========
@@ -497,9 +727,16 @@ app.get('/', (req, res) => {
       'WhatsApp': {
         'GET /whatsapp/qr': 'Get QR code for WhatsApp connection',
         'POST /whatsapp/send': 'Send WhatsApp message',
-        'GET /whatsapp/status': 'Check WhatsApp connection status'
+        'GET /whatsapp/status': 'Check WhatsApp connection status',
+        'POST /whatsapp/reconnect': 'Manually trigger WhatsApp reconnection'
       },
       'GET /health': 'Health check'
+    },
+    currentStatus: {
+      whatsappConnected: isWhatsAppConnected,
+      whatsappConnecting: isConnecting,
+      qrAvailable: !!qrCode,
+      hasError: !!connectionError
     }
   });
 });
