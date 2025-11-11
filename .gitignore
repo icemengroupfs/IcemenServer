@@ -103,3 +103,10 @@ Thumbs.db
 # Build directories
 dist/
 build/
+
+# Baileys authentication files
+baileys_auth_info/
+baileys_auth_info_*/
+auth_info_*/
+*.json
+*.creds

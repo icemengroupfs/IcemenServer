@@ -1,11 +1,9 @@
 const express = require('express');
 const twilio = require('twilio');
 const cors = require('cors');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
-const path = require('path');
-const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
@@ -18,7 +16,6 @@ app.use(express.json());
 // Request logging middleware
 app.use((req, res, next) => {
   console.log(`📥 ${new Date().toISOString()} - ${req.method} ${req.path}`);
-  console.log('Headers:', JSON.stringify(req.headers, null, 2));
   if (req.body && Object.keys(req.body).length > 0) {
     console.log('Body:', JSON.stringify(req.body, null, 2));
   }
@@ -31,99 +28,131 @@ const client = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-
-
 // WhatsApp Bot State
 let whatsappSocket = null;
 let isWhatsAppConnected = false;
 let qrCode = null;
 
-
-// WhatsApp Message Handler
+// WhatsApp Message Handler - UPDATED WITH PROPER LOGGER
 async function connectToWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
-  
-  const { version } = await fetchLatestBaileysVersion();
-  
-  whatsappSocket = makeWASocket({
-    version,
-    logger: {
-      level: 'silent' // Change to 'debug' for troubleshooting
-    },
-    printQRInTerminal: true,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, {
-        logger: {
-          level: 'silent'
-        }
-      }),
-    },
-    browser: ['Baileys Bot', 'Chrome', '1.0.0'],
-    generateHighQualityLinkPreview: true,
-  });
-
-  // Handle connection updates
-  whatsappSocket.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
+    const { version } = await fetchLatestBaileysVersion();
     
-    if (qr) {
-      qrCode = qr;
-      console.log('📱 WhatsApp QR Code received - scan with your phone');
-      qrcode.generate(qr, { small: true });
-    }
+    // Create a proper logger that Baileys expects
+    const logger = {
+      level: 'silent',
+      fatal: () => {},
+      error: () => {},
+      warn: () => {},
+      info: () => {},
+      debug: () => {},
+      trace: () => {},
+      child: () => logger // Return itself for child loggers
+    };
 
-    if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-      
-      console.log(`⚠️ WhatsApp connection closed due to ${lastDisconnect?.error?.message || 'unknown reason'}, reconnecting ${shouldReconnect}`);
-      
-      if (shouldReconnect) {
-        connectToWhatsApp();
-      } else {
-        isWhatsAppConnected = false;
-        console.log('❌ WhatsApp logged out, please scan QR code again');
-      }
-    } else if (connection === 'open') {
-      isWhatsAppConnected = true;
-      qrCode = null;
-      console.log('✅ WhatsApp connected successfully!');
-    }
-  });
-
-  // Save credentials whenever they're updated
-  whatsappSocket.ev.on('creds.update', saveCreds);
-
-  // Handle incoming WhatsApp messages
-  whatsappSocket.ev.on('messages.upsert', async (m) => {
-    const message = m.messages[0];
-    
-    // Only process messages that are not from the bot itself and are not status updates
-    if (message.key.fromMe || !message.message || message.message.protocolMessage) return;
-
-    console.log('📱 New WhatsApp message:', {
-      from: message.key.remoteJid,
-      message: message.message.conversation || Object.keys(message.message)[0],
-      timestamp: new Date(message.messageTimestamp * 1000).toISOString()
+    // Updated socket configuration for new Baileys version
+    whatsappSocket = makeWASocket({
+      version,
+      logger: logger,
+      auth: {
+        creds: state.creds,
+        keys: state.keys,
+      },
+      browser: ['Baileys Bot', 'Chrome', '1.0.0'],
     });
 
-    // Forward to your n8n webhook or process here
-    if (process.env.N8N_WEBHOOK_URL) {
-      await forwardToN8n(message);
-    }
+    // Handle connection updates
+    whatsappSocket.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      
+      // Handle QR code generation
+      if (qr) {
+        qrCode = qr;
+        console.log('📱 WhatsApp QR Code received - scan with your phone');
+        qrcode.generate(qr, { small: true });
+        console.log(`🔗 Or visit: http://localhost:${PORT}/whatsapp/qr`);
+      }
 
-    // Auto-reply example
-    await handleIncomingMessage(message);
-  });
+      if (connection === 'close') {
+        const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+        
+        console.log(`⚠️ WhatsApp connection closed due to ${lastDisconnect?.error?.message || 'unknown reason'}, reconnecting ${shouldReconnect}`);
+        
+        if (shouldReconnect) {
+          setTimeout(() => connectToWhatsApp(), 5000);
+        } else {
+          isWhatsAppConnected = false;
+          console.log('❌ WhatsApp logged out, please scan QR code again');
+        }
+      } else if (connection === 'open') {
+        isWhatsAppConnected = true;
+        qrCode = null;
+        console.log('✅ WhatsApp connected successfully!');
+      }
+    });
+
+    // Save credentials whenever they're updated
+    whatsappSocket.ev.on('creds.update', saveCreds);
+
+    // Handle incoming WhatsApp messages
+    whatsappSocket.ev.on('messages.upsert', async (m) => {
+      const message = m.messages[0];
+      
+      // Only process messages that are not from the bot itself and are not status updates
+      if (message.key.fromMe || !message.message || message.message.protocolMessage) return;
+
+      const messageText = getMessageText(message);
+      console.log('📱 New WhatsApp message:', {
+        from: message.key.remoteJid,
+        message: messageText,
+        timestamp: new Date(message.messageTimestamp * 1000).toISOString()
+      });
+
+      // Forward to your n8n webhook or process here
+      if (process.env.N8N_WEBHOOK_URL) {
+        await forwardToN8n(message);
+      }
+
+      // Auto-reply example
+      await handleIncomingMessage(message);
+    });
+
+  } catch (error) {
+    console.error('❌ Error connecting to WhatsApp:', error);
+    // Retry after 10 seconds
+    setTimeout(() => connectToWhatsApp(), 10000);
+  }
+}
+
+// Helper function to extract message text from different message types
+function getMessageText(message) {
+  if (message.message?.conversation) {
+    return message.message.conversation;
+  }
+  if (message.message?.extendedTextMessage?.text) {
+    return message.message.extendedTextMessage.text;
+  }
+  if (message.message?.imageMessage?.caption) {
+    return message.message.imageMessage.caption;
+  }
+  if (message.message?.videoMessage?.caption) {
+    return message.message.videoMessage.caption;
+  }
+  if (message.message?.documentMessage?.caption) {
+    return message.message.documentMessage.caption;
+  }
+  return 'Unsupported message type';
 }
 
 // Forward message to n8n
 async function forwardToN8n(message) {
   try {
+    const messageText = getMessageText(message);
     const payload = {
       platform: 'whatsapp',
       from: message.key.remoteJid,
-      message: message.message.conversation || JSON.stringify(message.message),
+      message: messageText,
       timestamp: new Date(message.messageTimestamp * 1000).toISOString(),
       messageId: message.key.id
     };
@@ -147,17 +176,19 @@ async function forwardToN8n(message) {
 // Handle incoming WhatsApp messages
 async function handleIncomingMessage(message) {
   const jid = message.key.remoteJid;
-  const text = message.message.conversation?.toLowerCase() || '';
+  const text = getMessageText(message).toLowerCase() || '';
 
   try {
     // Simple auto-reply logic
-    if (text.includes('hello') || text.includes('hi')) {
+    if (text.includes('hello') || text.includes('hi') || text.includes('hola')) {
       await sendWhatsAppMessage(jid, 'Hello! 👋 Thanks for messaging us. How can I help you today?');
     } else if (text.includes('help')) {
       await sendWhatsAppMessage(jid, 'I can help you with:\n• Order information\n• Support requests\n• General inquiries\n\nType "agent" to speak with a human.');
     } else if (text.includes('agent')) {
       await sendWhatsAppMessage(jid, 'A human agent will contact you shortly. Please wait...');
       // Here you can trigger email/notification to owner
+    } else if (text.includes('order') || text.includes('price') || text.includes('cost')) {
+      await sendWhatsAppMessage(jid, 'For order and pricing information, please visit our website or type "agent" to speak with a sales representative.');
     } else {
       await sendWhatsAppMessage(jid, 'Thanks for your message! Our team will get back to you soon.');
     }
@@ -182,28 +213,100 @@ async function sendWhatsAppMessage(jid, text) {
   }
 }
 
+// ========== WHATSAPP ENDPOINTS ==========
 
+// GET /whatsapp/qr - Get QR code for WhatsApp connection
+app.get('/whatsapp/qr', (req, res) => {
+  if (isWhatsAppConnected) {
+    return res.json({
+      success: true,
+      status: 'connected',
+      message: 'WhatsApp is already connected'
+    });
+  }
 
+  if (qrCode) {
+    // Return QR code as SVG for web display
+    qrcode.toString(qrCode, { type: 'svg' }, (err, svg) => {
+      if (err) {
+        return res.status(500).json({
+          success: false,
+          error: 'Failed to generate QR code'
+        });
+      }
+      
+      res.set('Content-Type', 'image/svg+xml');
+      res.send(`
+        <div style="text-align: center; font-family: Arial, sans-serif;">
+          <h2>Scan WhatsApp QR Code</h2>
+          ${svg}
+          <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
+          <p>Status: Waiting for scan...</p>
+        </div>
+      `);
+    });
+  } else {
+    res.json({
+      success: false,
+      status: 'initializing',
+      message: 'QR code not generated yet, please try again in a few seconds'
+    });
+  }
+});
 
+// POST /whatsapp/send - Send WhatsApp message
+app.post('/whatsapp/send', async (req, res) => {
+  const requestId = Date.now();
+  console.log(`\n📱 [${requestId}] NEW WHATSAPP MESSAGE REQUEST`);
+  
+  try {
+    const { to, message } = req.body;
+    
+    if (!to || !message) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: "to" and "message" are required'
+      });
+    }
 
+    if (!isWhatsAppConnected) {
+      return res.status(400).json({
+        success: false,
+        error: 'WhatsApp is not connected. Please scan QR code first at /whatsapp/qr'
+      });
+    }
 
+    // Ensure phone number has @s.whatsapp.net suffix
+    const formattedTo = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    
+    await sendWhatsAppMessage(formattedTo, message);
+    
+    res.json({
+      success: true,
+      message: 'WhatsApp message sent successfully',
+      to: formattedTo
+    });
 
+  } catch (error) {
+    console.error(`❌ [${requestId}] Error sending WhatsApp message:`, error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send WhatsApp message: ' + error.message
+    });
+  }
+});
 
+// GET /whatsapp/status - Check WhatsApp connection status
+app.get('/whatsapp/status', (req, res) => {
+  res.json({
+    success: true,
+    connected: isWhatsAppConnected,
+    status: isWhatsAppConnected ? 'connected' : 'disconnected',
+    qrAvailable: !!qrCode
+  });
+});
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// ========== EXISTING TWILIO ENDPOINTS ==========
 
 // Input validation function
 function validatePhoneNumber(phone) {
@@ -377,17 +480,25 @@ app.get('/health', (req, res) => {
     success: true,
     message: 'Server is running',
     timestamp: new Date().toISOString(),
-    twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_NUMBER)
+    twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_NUMBER),
+    whatsappStatus: isWhatsAppConnected ? 'connected' : 'disconnected'
   });
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
-    message: 'Twilio SMS Server is running!',
+    message: 'Dual SMS/WhatsApp Server is running!',
     endpoints: {
-      'POST /send-sms': 'Send an SMS message',
-      'GET /messages': 'Get last 20 messages',
+      'SMS': {
+        'POST /send-sms': 'Send SMS via Twilio',
+        'GET /messages': 'Get last 20 SMS messages'
+      },
+      'WhatsApp': {
+        'GET /whatsapp/qr': 'Get QR code for WhatsApp connection',
+        'POST /whatsapp/send': 'Send WhatsApp message',
+        'GET /whatsapp/status': 'Check WhatsApp connection status'
+      },
       'GET /health': 'Health check'
     }
   });
@@ -402,13 +513,25 @@ app.use((error, req, res, next) => {
   });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log('\n🚀 ========================================');
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📱 Twilio Number: ${process.env.TWILIO_NUMBER || '⚠️ NOT CONFIGURED'}`);
-  console.log(`🔑 Twilio SID: ${process.env.TWILIO_ACCOUNT_SID ? '✅ Set' : '❌ Missing'}`);
-  console.log(`🔑 Twilio Token: ${process.env.TWILIO_AUTH_TOKEN ? '✅ Set' : '❌ Missing'}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-  console.log('🚀 ========================================\n');
-});
+// Start server and initialize WhatsApp
+async function startServer() {
+  try {
+    // Initialize WhatsApp connection
+    await connectToWhatsApp();
+    
+    app.listen(PORT, () => {
+      console.log('\n🚀 ========================================');
+      console.log(`🚀 Dual SMS/WhatsApp Server running on port ${PORT}`);
+      console.log(`📱 Twilio Number: ${process.env.TWILIO_NUMBER || '⚠️ NOT CONFIGURED'}`);
+      console.log(`🤖 WhatsApp Status: ${isWhatsAppConnected ? '✅ Connected' : '⏳ Waiting for QR scan'}`);
+      console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+      console.log(`🔗 WhatsApp QR: http://localhost:${PORT}/whatsapp/qr`);
+      console.log('🚀 ========================================\n');
+    });
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
