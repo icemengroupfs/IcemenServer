@@ -1,6 +1,11 @@
 const express = require('express');
 const twilio = require('twilio');
 const cors = require('cors');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const qrcode = require('qrcode-terminal');
+const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
@@ -25,6 +30,180 @@ const client = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
+
+
+
+// WhatsApp Bot State
+let whatsappSocket = null;
+let isWhatsAppConnected = false;
+let qrCode = null;
+
+
+// WhatsApp Message Handler
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
+  
+  const { version } = await fetchLatestBaileysVersion();
+  
+  whatsappSocket = makeWASocket({
+    version,
+    logger: {
+      level: 'silent' // Change to 'debug' for troubleshooting
+    },
+    printQRInTerminal: true,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, {
+        logger: {
+          level: 'silent'
+        }
+      }),
+    },
+    browser: ['Baileys Bot', 'Chrome', '1.0.0'],
+    generateHighQualityLinkPreview: true,
+  });
+
+  // Handle connection updates
+  whatsappSocket.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    
+    if (qr) {
+      qrCode = qr;
+      console.log('📱 WhatsApp QR Code received - scan with your phone');
+      qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === 'close') {
+      const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      
+      console.log(`⚠️ WhatsApp connection closed due to ${lastDisconnect?.error?.message || 'unknown reason'}, reconnecting ${shouldReconnect}`);
+      
+      if (shouldReconnect) {
+        connectToWhatsApp();
+      } else {
+        isWhatsAppConnected = false;
+        console.log('❌ WhatsApp logged out, please scan QR code again');
+      }
+    } else if (connection === 'open') {
+      isWhatsAppConnected = true;
+      qrCode = null;
+      console.log('✅ WhatsApp connected successfully!');
+    }
+  });
+
+  // Save credentials whenever they're updated
+  whatsappSocket.ev.on('creds.update', saveCreds);
+
+  // Handle incoming WhatsApp messages
+  whatsappSocket.ev.on('messages.upsert', async (m) => {
+    const message = m.messages[0];
+    
+    // Only process messages that are not from the bot itself and are not status updates
+    if (message.key.fromMe || !message.message || message.message.protocolMessage) return;
+
+    console.log('📱 New WhatsApp message:', {
+      from: message.key.remoteJid,
+      message: message.message.conversation || Object.keys(message.message)[0],
+      timestamp: new Date(message.messageTimestamp * 1000).toISOString()
+    });
+
+    // Forward to your n8n webhook or process here
+    if (process.env.N8N_WEBHOOK_URL) {
+      await forwardToN8n(message);
+    }
+
+    // Auto-reply example
+    await handleIncomingMessage(message);
+  });
+}
+
+// Forward message to n8n
+async function forwardToN8n(message) {
+  try {
+    const payload = {
+      platform: 'whatsapp',
+      from: message.key.remoteJid,
+      message: message.message.conversation || JSON.stringify(message.message),
+      timestamp: new Date(message.messageTimestamp * 1000).toISOString(),
+      messageId: message.key.id
+    };
+
+    const response = await fetch(process.env.N8N_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (response.ok) {
+      console.log('✅ Message forwarded to n8n');
+    }
+  } catch (error) {
+    console.error('❌ Error forwarding to n8n:', error);
+  }
+}
+
+// Handle incoming WhatsApp messages
+async function handleIncomingMessage(message) {
+  const jid = message.key.remoteJid;
+  const text = message.message.conversation?.toLowerCase() || '';
+
+  try {
+    // Simple auto-reply logic
+    if (text.includes('hello') || text.includes('hi')) {
+      await sendWhatsAppMessage(jid, 'Hello! 👋 Thanks for messaging us. How can I help you today?');
+    } else if (text.includes('help')) {
+      await sendWhatsAppMessage(jid, 'I can help you with:\n• Order information\n• Support requests\n• General inquiries\n\nType "agent" to speak with a human.');
+    } else if (text.includes('agent')) {
+      await sendWhatsAppMessage(jid, 'A human agent will contact you shortly. Please wait...');
+      // Here you can trigger email/notification to owner
+    } else {
+      await sendWhatsAppMessage(jid, 'Thanks for your message! Our team will get back to you soon.');
+    }
+  } catch (error) {
+    console.error('❌ Error handling WhatsApp message:', error);
+  }
+}
+
+// Send WhatsApp message
+async function sendWhatsAppMessage(jid, text) {
+  if (!whatsappSocket || !isWhatsAppConnected) {
+    throw new Error('WhatsApp is not connected');
+  }
+
+  try {
+    await whatsappSocket.sendMessage(jid, { text: text });
+    console.log(`✅ WhatsApp message sent to ${jid}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Error sending WhatsApp message:', error);
+    throw error;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // Input validation function
 function validatePhoneNumber(phone) {
