@@ -255,9 +255,49 @@ async function sendWhatsAppMessage(jid, text) {
 // ========== WHATSAPP ENDPOINTS ==========
 
 // GET /whatsapp/qr - Get QR code for WhatsApp connection
-app.get('/whatsapp/qr', (req, res) => {
+app.get('/whatsapp/qr', async (req, res) => {
   // Set timeout to prevent infinite loading
   res.setTimeout(30000);
+
+  try {
+    // If WhatsApp hasn't been initialized yet, start it now
+    if (!whatsappSocket && !isConnecting && !connectionError) {
+      console.log('🔄 First visit to /whatsapp/qr - initializing WhatsApp...');
+      // Don't await - let it run in background
+      connectToWhatsApp().catch(err => {
+        console.error('❌ WhatsApp initialization error:', err);
+        connectionError = err.message;
+      });
+      
+      // Show loading page
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta http-equiv="refresh" content="3">
+            <title>Initializing WhatsApp</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
+              .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+              .spinner { width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #25d366; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px auto; }
+              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+              .status { background: #fff3cd; color: #856404; padding: 15px; border-radius: 5px; margin-top: 20px; }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <div class="spinner"></div>
+              <h2>Starting WhatsApp Connection</h2>
+              <p>Initializing for the first time...</p>
+              <div class="status">Please wait, this may take a few seconds</div>
+              <p style="margin-top: 20px; color: #666; font-size: 14px;">This page will refresh automatically</p>
+            </div>
+          </body>
+        </html>
+      `);
+    }
 
   if (isWhatsAppConnected) {
     return res.send(`
@@ -455,6 +495,32 @@ app.get('/whatsapp/qr', (req, res) => {
               ${isConnecting ? 'Connecting to WhatsApp servers...' : 'Starting connection process...'}
             </div>
             <p style="margin-top: 20px; color: #666; font-size: 14px;">This page will refresh automatically</p>
+          </div>
+        </body>
+      </html>
+    `);
+  }
+  } catch (error) {
+    console.error('❌ Error in /whatsapp/qr endpoint:', error);
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="UTF-8">
+          <title>Error</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
+            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; }
+            .error { color: #dc3545; font-size: 48px; margin-bottom: 20px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="error">❌</div>
+            <h2>Endpoint Error</h2>
+            <p style="color: red;">${error.message}</p>
+            <button onclick="location.reload()" style="background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer;">Retry</button>
+            <p style="margin-top: 20px;"><a href="/debug">Check Debug Info</a></p>
           </div>
         </body>
       </html>
@@ -739,6 +805,53 @@ app.get('/ping', (req, res) => {
   res.send('pong');
 });
 
+// Diagnostic endpoint
+app.get('/debug', (req, res) => {
+  res.json({
+    server: 'running',
+    nodeVersion: process.version,
+    platform: process.platform,
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    env: {
+      PORT: process.env.PORT,
+      NODE_ENV: process.env.NODE_ENV,
+      TWILIO_CONFIGURED: !!process.env.TWILIO_ACCOUNT_SID,
+      DISABLE_WHATSAPP: process.env.DISABLE_WHATSAPP
+    },
+    whatsapp: {
+      connected: isWhatsAppConnected,
+      connecting: isConnecting,
+      qrAvailable: !!qrCode,
+      error: connectionError,
+      socketExists: !!whatsappSocket
+    }
+  });
+});
+
+// Diagnostic endpoint
+app.get('/debug', (req, res) => {
+  res.json({
+    server: 'running',
+    nodeVersion: process.version,
+    platform: process.platform,
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    env: {
+      PORT: process.env.PORT,
+      NODE_ENV: process.env.NODE_ENV,
+      TWILIO_CONFIGURED: !!process.env.TWILIO_ACCOUNT_SID,
+      DISABLE_WHATSAPP: process.env.DISABLE_WHATSAPP
+    },
+    whatsapp: {
+      connected: isWhatsAppConnected,
+      connecting: isConnecting,
+      qrAvailable: !!qrCode,
+      error: connectionError
+    }
+  });
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
@@ -778,22 +891,38 @@ app.use((error, req, res, next) => {
 async function startServer() {
   try {
     // Start Express server FIRST (so it can respond to health checks)
-    app.listen(PORT, '0.0.0.0', () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       console.log('\n🚀 ========================================');
       console.log(`🚀 Dual SMS/WhatsApp Server running on port ${PORT}`);
       console.log(`📱 Twilio Number: ${process.env.TWILIO_NUMBER || '⚠️ NOT CONFIGURED'}`);
       console.log(`🤖 WhatsApp Status: Initializing...`);
       console.log(`🔗 Health check: http://localhost:${PORT}/health`);
       console.log(`🔗 WhatsApp QR: http://localhost:${PORT}/whatsapp/qr`);
+      console.log(`🚀 Server is READY and listening on port ${PORT}`);
       console.log('🚀 ========================================\n');
       
       // Initialize WhatsApp connection AFTER server is running
       // Don't await - let it run in background
-      connectToWhatsApp().catch(err => {
-        console.error('❌ WhatsApp initialization error:', err);
-        connectionError = err.message;
-      });
+      // Only initialize if not in minimal mode
+      if (process.env.DISABLE_WHATSAPP !== 'true') {
+        connectToWhatsApp().catch(err => {
+          console.error('❌ WhatsApp initialization error:', err.message);
+          connectionError = `WhatsApp init failed: ${err.message}`;
+        });
+      } else {
+        console.log('⚠️ WhatsApp disabled via DISABLE_WHATSAPP env var');
+      }
     });
+
+    // Handle server errors
+    server.on('error', (error) => {
+      console.error('❌ Server error:', error);
+      if (error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use`);
+      }
+      process.exit(1);
+    });
+
   } catch (error) {
     console.error('❌ Failed to start server:', error);
     process.exit(1);
@@ -803,6 +932,7 @@ async function startServer() {
 // Handle uncaught errors
 process.on('uncaughtException', (error) => {
   console.error('❌ Uncaught Exception:', error);
+  console.error('Stack:', error.stack);
   // Don't exit - keep server running
 });
 
@@ -810,5 +940,11 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
   // Don't exit - keep server running
 });
+
+// Log when process starts
+console.log('🔵 Starting server process...');
+console.log('🔵 Node version:', process.version);
+console.log('🔵 Environment:', process.env.NODE_ENV || 'development');
+console.log('🔵 PORT:', PORT);
 
 startServer();
