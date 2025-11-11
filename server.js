@@ -1,6 +1,7 @@
 const express = require('express');
 const twilio = require('twilio');
 const cors = require('cors');
+const fs = require('fs');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
@@ -47,7 +48,15 @@ async function connectToWhatsApp() {
 
   try {
     console.log('🔄 Initializing WhatsApp connection...');
-    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
+    
+    // Create auth state directory if it doesn't exist
+    const authDir = './baileys_auth_info';
+    if (!fs.existsSync(authDir)) {
+      fs.mkdirSync(authDir, { recursive: true });
+      console.log('📁 Created auth directory:', authDir);
+    }
+    
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
     
     console.log(`📦 Using Baileys version: ${version.join('.')}`);
@@ -73,6 +82,7 @@ async function connectToWhatsApp() {
         keys: state.keys,
       },
       browser: ['Baileys Bot', 'Chrome', '1.0.0'],
+      connectTimeoutMs: 60000, // 60 seconds timeout
     });
 
     isConnecting = false;
@@ -86,7 +96,7 @@ async function connectToWhatsApp() {
         qrCode = qr;
         console.log('📱 WhatsApp QR Code received - scan with your phone');
         qrcode.generate(qr, { small: true });
-        console.log(`🔗 Or visit: http://localhost:${PORT}/whatsapp/qr`);
+        console.log(`🔗 Visit /whatsapp/qr to scan`);
       }
 
       if (connection === 'close') {
@@ -102,12 +112,15 @@ async function connectToWhatsApp() {
         } else {
           connectionError = 'Logged out - please scan QR code again';
           console.log('❌ WhatsApp logged out, please scan QR code again');
+          qrCode = null; // Clear old QR
         }
       } else if (connection === 'open') {
         isWhatsAppConnected = true;
         qrCode = null;
         connectionError = null;
         console.log('✅ WhatsApp connected successfully!');
+      } else if (connection === 'connecting') {
+        console.log('🔄 WhatsApp connecting...');
       }
     });
 
@@ -116,31 +129,36 @@ async function connectToWhatsApp() {
 
     // Handle incoming WhatsApp messages
     whatsappSocket.ev.on('messages.upsert', async (m) => {
-      const message = m.messages[0];
-      
-      // Only process messages that are not from the bot itself and are not status updates
-      if (message.key.fromMe || !message.message || message.message.protocolMessage) return;
+      try {
+        const message = m.messages[0];
+        
+        // Only process messages that are not from the bot itself and are not status updates
+        if (message.key.fromMe || !message.message || message.message.protocolMessage) return;
 
-      const messageText = getMessageText(message);
-      console.log('📱 New WhatsApp message:', {
-        from: message.key.remoteJid,
-        message: messageText,
-        timestamp: new Date(message.messageTimestamp * 1000).toISOString()
-      });
+        const messageText = getMessageText(message);
+        console.log('📱 New WhatsApp message:', {
+          from: message.key.remoteJid,
+          message: messageText,
+          timestamp: new Date(message.messageTimestamp * 1000).toISOString()
+        });
 
-      // Forward to your n8n webhook or process here
-      if (process.env.N8N_WEBHOOK_URL) {
-        await forwardToN8n(message);
+        // Forward to your n8n webhook or process here
+        if (process.env.N8N_WEBHOOK_URL) {
+          await forwardToN8n(message);
+        }
+
+        // Auto-reply example
+        await handleIncomingMessage(message);
+      } catch (error) {
+        console.error('❌ Error processing WhatsApp message:', error);
       }
-
-      // Auto-reply example
-      await handleIncomingMessage(message);
     });
 
   } catch (error) {
     isConnecting = false;
     connectionError = error.message;
-    console.error('❌ Error connecting to WhatsApp:', error);
+    console.error('❌ Error connecting to WhatsApp:', error.message);
+    console.error('Stack:', error.stack);
     // Retry after 10 seconds
     setTimeout(() => connectToWhatsApp(), 10000);
   }
@@ -711,8 +729,14 @@ app.get('/health', (req, res) => {
     message: 'Server is running',
     timestamp: new Date().toISOString(),
     twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_NUMBER),
-    whatsappStatus: isWhatsAppConnected ? 'connected' : 'disconnected'
+    whatsappStatus: isWhatsAppConnected ? 'connected' : (isConnecting ? 'connecting' : 'disconnected'),
+    whatsappError: connectionError || null
   });
+});
+
+// Simple ping endpoint for monitoring
+app.get('/ping', (req, res) => {
+  res.send('pong');
 });
 
 // Root endpoint
@@ -753,22 +777,38 @@ app.use((error, req, res, next) => {
 // Start server and initialize WhatsApp
 async function startServer() {
   try {
-    // Initialize WhatsApp connection
-    await connectToWhatsApp();
-    
-    app.listen(PORT, () => {
+    // Start Express server FIRST (so it can respond to health checks)
+    app.listen(PORT, '0.0.0.0', () => {
       console.log('\n🚀 ========================================');
       console.log(`🚀 Dual SMS/WhatsApp Server running on port ${PORT}`);
       console.log(`📱 Twilio Number: ${process.env.TWILIO_NUMBER || '⚠️ NOT CONFIGURED'}`);
-      console.log(`🤖 WhatsApp Status: ${isWhatsAppConnected ? '✅ Connected' : '⏳ Waiting for QR scan'}`);
+      console.log(`🤖 WhatsApp Status: Initializing...`);
       console.log(`🔗 Health check: http://localhost:${PORT}/health`);
       console.log(`🔗 WhatsApp QR: http://localhost:${PORT}/whatsapp/qr`);
       console.log('🚀 ========================================\n');
+      
+      // Initialize WhatsApp connection AFTER server is running
+      // Don't await - let it run in background
+      connectToWhatsApp().catch(err => {
+        console.error('❌ WhatsApp initialization error:', err);
+        connectionError = err.message;
+      });
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);
     process.exit(1);
   }
 }
+
+// Handle uncaught errors
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+  // Don't exit - keep server running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit - keep server running
+});
 
 startServer();
