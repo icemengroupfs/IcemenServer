@@ -2,9 +2,11 @@ const express = require('express');
 const twilio = require('twilio');
 const cors = require('cors');
 const fs = require('fs');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-const qrcode = require('qrcode-terminal');
+const terminalQR = require('qrcode-terminal');
+const webQR = require('qrcode');
+const pino = require('pino');
 require('dotenv').config();
 
 const app = express();
@@ -61,17 +63,8 @@ async function connectToWhatsApp() {
     
     console.log(`📦 Using Baileys version: ${version.join('.')}`);
     
-    // Create a proper logger that Baileys expects
-    const logger = {
-      level: 'silent',
-      fatal: () => {},
-      error: () => {},
-      warn: () => {},
-      info: () => {},
-      debug: () => {},
-      trace: () => {},
-      child: () => logger // Return itself for child loggers
-    };
+    // Use pino logger
+    const logger = pino({ level: 'silent' });
 
     // Updated socket configuration for new Baileys version
     whatsappSocket = makeWASocket({
@@ -79,7 +72,7 @@ async function connectToWhatsApp() {
       logger: logger,
       auth: {
         creds: state.creds,
-        keys: state.keys,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
       browser: ['Baileys Bot', 'Chrome', '1.0.0'],
       connectTimeoutMs: 60000, // 60 seconds timeout
@@ -95,7 +88,7 @@ async function connectToWhatsApp() {
       if (qr) {
         qrCode = qr;
         console.log('📱 WhatsApp QR Code received - scan with your phone');
-        qrcode.generate(qr, { small: true });
+        terminalQR.generate(qr, { small: true });
         console.log(`🔗 Visit /whatsapp/qr to scan`);
       }
 
@@ -366,7 +359,7 @@ app.get('/whatsapp/qr', async (req, res) => {
 
   if (qrCode) {
     // Return QR code as SVG for web display
-    qrcode.toString(qrCode, { type: 'svg' }, (err, svg) => {
+    webQR.toString(qrCode, { type: 'svg' }, (err, svg) => {
       if (err) {
         return res.status(500).send(`
           <!DOCTYPE html>
@@ -825,29 +818,6 @@ app.get('/debug', (req, res) => {
       qrAvailable: !!qrCode,
       error: connectionError,
       socketExists: !!whatsappSocket
-    }
-  });
-});
-
-// Diagnostic endpoint
-app.get('/debug', (req, res) => {
-  res.json({
-    server: 'running',
-    nodeVersion: process.version,
-    platform: process.platform,
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    env: {
-      PORT: process.env.PORT,
-      NODE_ENV: process.env.NODE_ENV,
-      TWILIO_CONFIGURED: !!process.env.TWILIO_ACCOUNT_SID,
-      DISABLE_WHATSAPP: process.env.DISABLE_WHATSAPP
-    },
-    whatsapp: {
-      connected: isWhatsAppConnected,
-      connecting: isConnecting,
-      qrAvailable: !!qrCode,
-      error: connectionError
     }
   });
 });
