@@ -38,7 +38,57 @@ let qrCode = null;
 let connectionError = null;
 let isConnecting = false;
 
-// WhatsApp Message Handler - UPDATED WITH PROPER LOGGER
+// ========== AUTO-PING SYSTEM TO KEEP RENDER AWAKE ==========
+
+let pingInterval = null;
+let lastPingTime = null;
+
+// Function to ping our own server
+async function pingServer() {
+  try {
+    const response = await fetch(`http://localhost:${PORT}/ping`);
+    const result = await response.text();
+    lastPingTime = new Date().toISOString();
+    console.log(`🔄 Auto-ping successful: ${result} at ${lastPingTime}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Auto-ping failed:', error.message);
+    return false;
+  }
+}
+
+// Start auto-ping system
+function startAutoPing() {
+  // Clear existing interval if any
+  if (pingInterval) {
+    clearInterval(pingInterval);
+  }
+  
+  // Ping immediately on startup
+  pingServer();
+  
+  // Set up interval for every 8 minutes (480,000 ms)
+  pingInterval = setInterval(() => {
+    pingServer();
+  }, 8 * 60 * 1000); // 8 minutes in milliseconds
+  
+  console.log(`🔄 Auto-ping system started: pinging every 8 minutes`);
+  console.log(`🔄 Next ping in: 8 minutes`);
+  console.log(`🔄 Render sleep prevention: ACTIVE`);
+}
+
+// Stop auto-ping system
+function stopAutoPing() {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
+    console.log('🔄 Auto-ping system stopped');
+  }
+}
+
+// ========== WHATSAPP CONNECTION ==========
+
+// WhatsApp Message Handler
 async function connectToWhatsApp() {
   if (isConnecting) {
     console.log('⏳ WhatsApp connection already in progress...');
@@ -780,6 +830,31 @@ app.get('/messages', async (req, res) => {
   }
 });
 
+// ========== UPDATED PING ENDPOINT ==========
+
+// Enhanced ping endpoint with auto-ping status
+app.get('/ping', (req, res) => {
+  const response = {
+    pong: true,
+    timestamp: new Date().toISOString(),
+    server: 'Dual SMS/WhatsApp Server',
+    status: 'active',
+    autoPing: {
+      enabled: true,
+      interval: '8 minutes',
+      lastPing: lastPingTime,
+      nextPing: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 8 * 60 * 1000).toISOString() : 'Calculating...'
+    },
+    whatsapp: {
+      connected: isWhatsAppConnected,
+      status: isWhatsAppConnected ? 'connected' : 'disconnected'
+    }
+  };
+  
+  console.log(`🏓 Ping received - ${new Date().toISOString()}`);
+  res.json(response);
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   console.log('💚 Health check');
@@ -789,13 +864,13 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_NUMBER),
     whatsappStatus: isWhatsAppConnected ? 'connected' : (isConnecting ? 'connecting' : 'disconnected'),
-    whatsappError: connectionError || null
+    whatsappError: connectionError || null,
+    autoPing: {
+      active: !!pingInterval,
+      interval: '8 minutes',
+      lastPing: lastPingTime
+    }
   });
-});
-
-// Simple ping endpoint for monitoring
-app.get('/ping', (req, res) => {
-  res.send('pong');
 });
 
 // Diagnostic endpoint
@@ -818,6 +893,12 @@ app.get('/debug', (req, res) => {
       qrAvailable: !!qrCode,
       error: connectionError,
       socketExists: !!whatsappSocket
+    },
+    autoPing: {
+      enabled: !!pingInterval,
+      interval: '8 minutes',
+      lastPingTime: lastPingTime,
+      nextPingTime: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 8 * 60 * 1000).toISOString() : null
     }
   });
 });
@@ -837,13 +918,18 @@ app.get('/', (req, res) => {
         'GET /whatsapp/status': 'Check WhatsApp connection status',
         'POST /whatsapp/reconnect': 'Manually trigger WhatsApp reconnection'
       },
-      'GET /health': 'Health check'
+      'Monitoring': {
+        'GET /health': 'Health check',
+        'GET /ping': 'Ping with auto-ping status',
+        'GET /debug': 'Detailed diagnostics'
+      }
     },
     currentStatus: {
       whatsappConnected: isWhatsAppConnected,
       whatsappConnecting: isConnecting,
       qrAvailable: !!qrCode,
-      hasError: !!connectionError
+      hasError: !!connectionError,
+      autoPingActive: !!pingInterval
     }
   });
 });
@@ -870,6 +956,9 @@ async function startServer() {
       console.log(`🔗 WhatsApp QR: http://localhost:${PORT}/whatsapp/qr`);
       console.log(`🚀 Server is READY and listening on port ${PORT}`);
       console.log('🚀 ========================================\n');
+      
+      // Start auto-ping system to keep Render awake
+      startAutoPing();
       
       // Initialize WhatsApp connection AFTER server is running
       // Don't await - let it run in background
@@ -909,6 +998,19 @@ process.on('uncaughtException', (error) => {
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
   // Don't exit - keep server running
+});
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n🔄 Shutting down gracefully...');
+  stopAutoPing();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n🔄 Received SIGTERM, shutting down...');
+  stopAutoPing();
+  process.exit(0);
 });
 
 // Log when process starts
