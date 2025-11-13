@@ -43,13 +43,15 @@ let isConnecting = false;
 let pingInterval = null;
 let lastPingTime = null;
 
-// Function to ping our own server
+// Function to ping our own server EXTERNALLY
 async function pingServer() {
   try {
-    const response = await fetch(`http://localhost:${PORT}/ping`);
+    // Use external URL to generate inbound traffic
+    const externalUrl = process.env.RENDER_EXTERNAL_URL || 'https://icemenserver.onrender.com';
+    const response = await fetch(`${externalUrl}/ping`);
     const result = await response.text();
     lastPingTime = new Date().toISOString();
-    console.log(`🔄 Auto-ping successful: ${result} at ${lastPingTime}`);
+    console.log(`🔄 Auto-ping successful to ${externalUrl}: ${result} at ${lastPingTime}`);
     return true;
   } catch (error) {
     console.error('❌ Auto-ping failed:', error.message);
@@ -67,14 +69,14 @@ function startAutoPing() {
   // Ping immediately on startup
   pingServer();
   
-  // Set up interval for every 8 minutes (480,000 ms)
+  // Set up interval for every 10 minutes (600,000 ms) to stay under 15 min sleep
   pingInterval = setInterval(() => {
     pingServer();
-  }, 8 * 60 * 1000); // 8 minutes in milliseconds
+  }, 10 * 60 * 1000);
   
-  console.log(`🔄 Auto-ping system started: pinging every 8 minutes`);
-  console.log(`🔄 Next ping in: 8 minutes`);
-  console.log(`🔄 Render sleep prevention: ACTIVE`);
+  console.log(`🔄 Auto-ping system started: pinging external URL every 10 minutes`);
+  console.log(`🔄 Next ping in: 10 minutes`);
+  console.log(`🔄 Render sleep prevention: ACTIVE (but for reliability, use external cron like cron-job.org)`);
 }
 
 // Stop auto-ping system
@@ -113,8 +115,8 @@ async function connectToWhatsApp() {
     
     console.log(`📦 Using Baileys version: ${version.join('.')}`);
     
-    // Use pino logger
-    const logger = pino({ level: 'silent' });
+    // Use pino logger with debug level for better error visibility
+    const logger = pino({ level: 'debug' });
 
     // Updated socket configuration for new Baileys version
     whatsappSocket = makeWASocket({
@@ -841,9 +843,9 @@ app.get('/ping', (req, res) => {
     status: 'active',
     autoPing: {
       enabled: true,
-      interval: '8 minutes',
+      interval: '10 minutes',
       lastPing: lastPingTime,
-      nextPing: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 8 * 60 * 1000).toISOString() : 'Calculating...'
+      nextPing: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 10 * 60 * 1000).toISOString() : 'Calculating...'
     },
     whatsapp: {
       connected: isWhatsAppConnected,
@@ -867,7 +869,7 @@ app.get('/health', (req, res) => {
     whatsappError: connectionError || null,
     autoPing: {
       active: !!pingInterval,
-      interval: '8 minutes',
+      interval: '10 minutes',
       lastPing: lastPingTime
     }
   });
@@ -896,9 +898,9 @@ app.get('/debug', (req, res) => {
     },
     autoPing: {
       enabled: !!pingInterval,
-      interval: '8 minutes',
+      interval: '10 minutes',
       lastPingTime: lastPingTime,
-      nextPingTime: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 8 * 60 * 1000).toISOString() : null
+      nextPingTime: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 10 * 60 * 1000).toISOString() : null
     }
   });
 });
@@ -918,18 +920,13 @@ app.get('/', (req, res) => {
         'GET /whatsapp/status': 'Check WhatsApp connection status',
         'POST /whatsapp/reconnect': 'Manually trigger WhatsApp reconnection'
       },
-      'Monitoring': {
-        'GET /health': 'Health check',
-        'GET /ping': 'Ping with auto-ping status',
-        'GET /debug': 'Detailed diagnostics'
-      }
+      'GET /health': 'Health check'
     },
     currentStatus: {
       whatsappConnected: isWhatsAppConnected,
       whatsappConnecting: isConnecting,
       qrAvailable: !!qrCode,
-      hasError: !!connectionError,
-      autoPingActive: !!pingInterval
+      hasError: !!connectionError
     }
   });
 });
