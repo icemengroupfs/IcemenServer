@@ -187,9 +187,11 @@ async function connectToWhatsApp() {
           timestamp: new Date(message.messageTimestamp * 1000).toISOString()
         });
 
-        // Forward to your n8n webhook or process here
+        // ✅ ENHANCED: Forward to your n8n webhook
         if (process.env.N8N_WEBHOOK_URL) {
           await forwardToN8n(message);
+        } else {
+          console.log('⚠️ N8N_WEBHOOK_URL not set, skipping n8n forwarding');
         }
 
         // Auto-reply example
@@ -229,17 +231,29 @@ function getMessageText(message) {
   return 'Unsupported message type';
 }
 
-// Forward message to n8n
+// ✅ ENHANCED: Forward message to n8n with better error handling and timeout
 async function forwardToN8n(message) {
   try {
     const messageText = getMessageText(message);
     const payload = {
       platform: 'whatsapp',
       from: message.key.remoteJid,
-      message: messageText,
+      text: messageText, // Changed from 'message' to 'text' to match your n8n test
       timestamp: new Date(message.messageTimestamp * 1000).toISOString(),
-      messageId: message.key.id
+      messageId: message.key.id,
+      messageType: getMessageType(message),
+      isGroup: message.key.remoteJid?.includes('@g.us') || false
     };
+
+    console.log('📤 Forwarding to n8n:', {
+      from: payload.from,
+      text: payload.text,
+      timestamp: payload.timestamp
+    });
+
+    // Add timeout for Render environment
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
     const response = await fetch(process.env.N8N_WEBHOOK_URL, {
       method: 'POST',
@@ -247,14 +261,37 @@ async function forwardToN8n(message) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(payload),
+      signal: controller.signal
     });
 
+    clearTimeout(timeoutId);
+
     if (response.ok) {
-      console.log('✅ Message forwarded to n8n');
+      console.log('✅ Message successfully forwarded to n8n');
+      return true;
+    } else {
+      console.error('❌ n8n responded with error:', response.status, response.statusText);
+      return false;
     }
   } catch (error) {
-    console.error('❌ Error forwarding to n8n:', error);
+    if (error.name === 'AbortError') {
+      console.error('❌ n8n request timeout - webhook might be unreachable');
+    } else {
+      console.error('❌ Error forwarding to n8n:', error.message);
+    }
+    return false;
   }
+}
+
+// ✅ NEW: Helper function to determine message type
+function getMessageType(message) {
+  if (message.message?.conversation) return 'text';
+  if (message.message?.extendedTextMessage) return 'extended_text';
+  if (message.message?.imageMessage) return 'image';
+  if (message.message?.videoMessage) return 'video';
+  if (message.message?.documentMessage) return 'document';
+  if (message.message?.audioMessage) return 'audio';
+  return 'unknown';
 }
 
 // Handle incoming WhatsApp messages
@@ -665,6 +702,52 @@ app.post('/whatsapp/reconnect', async (req, res) => {
   }
 });
 
+// ✅ NEW: Test n8n connection endpoint
+app.post('/test-n8n', async (req, res) => {
+  try {
+    const { testMessage } = req.body;
+    
+    const payload = {
+      platform: 'whatsapp',
+      from: '2771xxxxxxx@s.whatsapp.net',
+      text: testMessage || 'Test message from server',
+      timestamp: new Date().toISOString(),
+      messageId: 'test-' + Date.now(),
+      messageType: 'text',
+      isGroup: false
+    };
+
+    console.log('🧪 Testing n8n connection with:', payload);
+
+    const response = await fetch(process.env.N8N_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (response.ok) {
+      res.json({
+        success: true,
+        message: 'Test message sent to n8n successfully',
+        status: response.status
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: `n8n responded with ${response.status}: ${response.statusText}`
+      });
+    }
+  } catch (error) {
+    console.error('❌ Test n8n error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // ========== EXISTING TWILIO ENDPOINTS ==========
 
 // Input validation function
@@ -850,6 +933,10 @@ app.get('/ping', (req, res) => {
     whatsapp: {
       connected: isWhatsAppConnected,
       status: isWhatsAppConnected ? 'connected' : 'disconnected'
+    },
+    n8n: {
+      configured: !!process.env.N8N_WEBHOOK_URL,
+      webhookUrl: process.env.N8N_WEBHOOK_URL ? '✅ Configured' : '❌ Not configured'
     }
   };
   
@@ -867,6 +954,7 @@ app.get('/health', (req, res) => {
     twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_NUMBER),
     whatsappStatus: isWhatsAppConnected ? 'connected' : (isConnecting ? 'connecting' : 'disconnected'),
     whatsappError: connectionError || null,
+    n8nConfigured: !!process.env.N8N_WEBHOOK_URL,
     autoPing: {
       active: !!pingInterval,
       interval: '10 minutes',
@@ -887,6 +975,7 @@ app.get('/debug', (req, res) => {
       PORT: process.env.PORT,
       NODE_ENV: process.env.NODE_ENV,
       TWILIO_CONFIGURED: !!process.env.TWILIO_ACCOUNT_SID,
+      N8N_CONFIGURED: !!process.env.N8N_WEBHOOK_URL,
       DISABLE_WHATSAPP: process.env.DISABLE_WHATSAPP
     },
     whatsapp: {
@@ -918,7 +1007,8 @@ app.get('/', (req, res) => {
         'GET /whatsapp/qr': 'Get QR code for WhatsApp connection',
         'POST /whatsapp/send': 'Send WhatsApp message',
         'GET /whatsapp/status': 'Check WhatsApp connection status',
-        'POST /whatsapp/reconnect': 'Manually trigger WhatsApp reconnection'
+        'POST /whatsapp/reconnect': 'Manually trigger WhatsApp reconnection',
+        'POST /test-n8n': 'Test n8n webhook connection'
       },
       'GET /health': 'Health check'
     },
@@ -926,7 +1016,8 @@ app.get('/', (req, res) => {
       whatsappConnected: isWhatsAppConnected,
       whatsappConnecting: isConnecting,
       qrAvailable: !!qrCode,
-      hasError: !!connectionError
+      hasError: !!connectionError,
+      n8nConfigured: !!process.env.N8N_WEBHOOK_URL
     }
   });
 });
@@ -949,6 +1040,7 @@ async function startServer() {
       console.log(`🚀 Dual SMS/WhatsApp Server running on port ${PORT}`);
       console.log(`📱 Twilio Number: ${process.env.TWILIO_NUMBER || '⚠️ NOT CONFIGURED'}`);
       console.log(`🤖 WhatsApp Status: Initializing...`);
+      console.log(`🔗 n8n Webhook: ${process.env.N8N_WEBHOOK_URL ? '✅ CONFIGURED' : '⚠️ NOT CONFIGURED'}`);
       console.log(`🔗 Health check: http://localhost:${PORT}/health`);
       console.log(`🔗 WhatsApp QR: http://localhost:${PORT}/whatsapp/qr`);
       console.log(`🚀 Server is READY and listening on port ${PORT}`);
