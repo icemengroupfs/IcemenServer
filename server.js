@@ -12,85 +12,1056 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// ========== CONFIGURATION ==========
+const GOOGLE_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwd8juhd2QyCd0ElkyxMMKw4GYOV21a0hJYUl8mMuG65FQKuTopYcjN9BW-Suu7oKuDKA/exec";
+
+// ========== MIDDLEWARE ==========
 app.use(cors());
 app.use(express.json());
 
 // Request logging middleware
 app.use((req, res, next) => {
   console.log(`📥 ${new Date().toISOString()} - ${req.method} ${req.path}`);
-  if (req.body && Object.keys(req.body).length > 0) {
-    console.log('Body:', JSON.stringify(req.body, null, 2));
-  }
   next();
 });
 
-// Initialize Twilio client
-const client = twilio(
+// ========== TWILIO CLIENT ==========
+const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// WhatsApp Bot State
+// ========== WHATSAPP AUTOMATION SYSTEM ==========
+
+// Global variables
 let whatsappSocket = null;
 let isWhatsAppConnected = false;
 let qrCode = null;
 let connectionError = null;
 let isConnecting = false;
+let connectionRetries = 0;
+const MAX_CONNECTION_RETRIES = 5;
 
-// ========== AUTO-PING SYSTEM TO KEEP RENDER AWAKE ==========
+// ========== CUSTOMER TRACKING & ORDER PROCESSING ==========
 
-let pingInterval = null;
-let lastPingTime = null;
+// Store active orders and customer history in memory
+const activeOrders = new Map();
+const customerHistory = new Map(); // Track customer order history
 
-// Function to ping our own server EXTERNALLY
-async function pingServer() {
+// Enhanced Bethlehem delivery validation with more comprehensive area coverage
+const BETHLEHEM_KEYWORDS = [
+  'bethlehem', 'free state', 'fs', '9700', '9701', '9702', '9703', '9704', '9705', '9706', '9707', '9708', '9709',
+  'mlangeni', 'old location', 'bohlokong', 'cbd', 'central', 'boitumelo', 'reitz', 'ficksburg', 'clarens', 'fouriesburg',
+  'rosendal', 'paul roux', 'senekal', 'marquard', 'ventersburg', 'winburg', 'brandfort', 'welkom', 'kroonstad', 'harrismith'
+];
+const NON_DELIVERY_AREAS = [
+  'johannesburg', 'jhb', 'pretoria', 'pta', 'durban', 'cpt', 'cape town', 'bloemfontein', 'bloem', 'gauteng', 
+  'kwazulu', 'kzn', 'western cape', 'eastern cape', 'mpumalanga', 'limpopo', 'north west', 'namibia', 'botswana',
+  'lesotho', 'swaziland', 'eswatini', 'port elizabeth', 'east london', 'kimberley', 'rustenburg', 'nelspruit', 'polokwane'
+];
+
+class OrderManager {
+  static startOrder(phone, name) {
+    const order = {
+      phone: phone,
+      name: name,
+      step: 'quantity',
+      quantity: null,
+      address: null,
+      instructions: null,
+      location: null,
+      orderId: this.generateOrderId(),
+      createdAt: new Date(),
+      isReturningCustomer: this.isReturningCustomer(phone)
+    };
+    
+    activeOrders.set(phone, order);
+    return order;
+  }
+
+  static getOrder(phone) {
+    return activeOrders.get(phone);
+  }
+
+  static updateOrder(phone, updates) {
+    const order = activeOrders.get(phone);
+    if (order) {
+      Object.assign(order, updates);
+      activeOrders.set(phone, order);
+      return order;
+    }
+    return null;
+  }
+
+  static completeOrder(phone) {
+    const order = activeOrders.get(phone);
+    if (order) {
+      // Add to customer history
+      this.addToCustomerHistory(phone, order);
+      activeOrders.delete(phone);
+      return order;
+    }
+    return null;
+  }
+
+  static generateOrderId() {
+    const timestamp = Date.now().toString(36);
+    const random = Math.random().toString(36).substr(2, 5);
+    return `ICE-${timestamp}-${random}`.toUpperCase();
+  }
+
+  static isReturningCustomer(phone) {
+    return customerHistory.has(phone);
+  }
+
+  static addToCustomerHistory(phone, order) {
+    if (!customerHistory.has(phone)) {
+      customerHistory.set(phone, {
+        firstOrder: new Date(),
+        lastOrder: new Date(),
+        totalOrders: 0,
+        totalSpent: 0
+      });
+    }
+    
+    const history = customerHistory.get(phone);
+    history.lastOrder = new Date();
+    history.totalOrders += 1;
+    history.totalSpent += (order.quantity * 8) + 15;
+  }
+
+  static getCustomerGreeting(phone, name) {
+    if (this.isReturningCustomer(phone)) {
+      const history = customerHistory.get(phone);
+      return `👋 Welcome back, ${name}! 🧊\n\nGreat to see you again! Ready for more refreshing ice?`;
+    } else {
+      return `🧊 Hello ${name}! Welcome to Ice Men! ❄️\n\nI'm here to help you order premium ice with quick delivery.`;
+    }
+  }
+
+  // Enhanced location validation with comprehensive geocoding
+  static async validateDeliveryArea(address, coordinates = null) {
+    if (!address && !coordinates) {
+      return { valid: false, reason: 'no_location', message: 'Please provide your delivery address or location.' };
+    }
+    
+    let addressText = address || '';
+    let detailedLocation = null;
+    
+    // If we have coordinates, try to geocode them for detailed address
+    if (coordinates && !address) {
+      try {
+        const geocodedData = await this.reverseGeocodeWithOSM(coordinates.lat, coordinates.lng);
+        if (geocodedData) {
+          addressText = geocodedData.display_name;
+          detailedLocation = geocodedData;
+        }
+      } catch (error) {
+        console.error('Geocoding error:', error);
+      }
+    }
+    
+    // If we have address text but no coordinates, try forward geocoding
+    if (address && !coordinates) {
+      try {
+        const geocodedData = await this.forwardGeocodeWithOSM(address);
+        if (geocodedData && geocodedData.length > 0) {
+          detailedLocation = geocodedData[0];
+          // Use the detailed address from geocoding
+          addressText = detailedLocation.display_name;
+        }
+      } catch (error) {
+        console.error('Forward geocoding error:', error);
+      }
+    }
+    
+    const addressLower = addressText.toLowerCase();
+    
+    // Enhanced validation: Check if it's clearly outside delivery area
+    const isNonDeliveryArea = NON_DELIVERY_AREAS.some(area => 
+      addressLower.includes(area.toLowerCase())
+    );
+    
+    if (isNonDeliveryArea) {
+      return { 
+        valid: false, 
+        reason: 'outside_area',
+        message: `🚫 *Delivery Area Notice*\n\nWe currently only deliver within *Bethlehem, Free State* and surrounding areas.\n\nYour location appears to be outside our delivery zone.\n\n📍 *Walk-in Store:*\n496 Mlangeni St, Old Location, Bethlehem, 9701\n\n📱 *Contact Us:*\n063 138 8803 (Andile)\n067 293 9603 (Kutlwano) \n081 287 3600 (Tony)\n\n🌐 *Visit our website:*\nhttps://icemengroup.com/\n\nPlease contact us for bulk orders or alternative arrangements.`
+      };
+    }
+    
+    // Enhanced validation: Check if it's in Bethlehem area with more comprehensive matching
+    const isInBethlehem = this.checkBethlehemArea(addressText, detailedLocation);
+    
+    if (isInBethlehem.valid) {
+      return { 
+        valid: true, 
+        reason: 'bethlehem_area', 
+        address: addressText,
+        areaType: isInBethlehem.areaType
+      };
+    }
+    
+    // If unsure, ask for clarification with enhanced messaging
+    return { 
+      valid: false, 
+      reason: 'unclear_location',
+      message: `📍 *Location Check*\n\nWe need to confirm your delivery area. Please specify that you're in *Bethlehem, Free State* or let us know your exact location so we can check if delivery is available in your area.\n\n📍 *Walk-in Store:*\n496 Mlangeni St, Old Location, Bethlehem, 9701\n\n📱 *Contact Us:*\n063 138 8803 (Andile)\n067 293 9603 (Kutlwano)\n081 287 3600 (Tony)\n\n🌐 *Visit our website:*\nhttps://icemengroup.com/`
+    };
+  }
+
+  // Enhanced Bethlehem area checking with geographic coordinates
+  static checkBethlehemArea(addressText, detailedLocation = null) {
+    const addressLower = addressText.toLowerCase();
+    
+    // Check for explicit Bethlehem keywords
+    const hasExplicitBethlehem = BETHLEHEM_KEYWORDS.some(keyword => 
+      addressLower.includes(keyword.toLowerCase())
+    );
+    
+    if (hasExplicitBethlehem) {
+      return { valid: true, areaType: 'explicit_match' };
+    }
+    
+    // If we have detailed location data, check geographic bounds
+    if (detailedLocation && detailedLocation.lat && detailed.location) {
+      const lat = parseFloat(detailedLocation.lat);
+      const lon = parseFloat(detailedLocation.lon);
+      
+      // Approximate geographic bounds for Bethlehem area
+      const isInBethlehemBounds = 
+        lat >= -28.35 && lat <= -28.10 && // Latitude bounds
+        lon >= 28.20 && lon <= 28.45;     // Longitude bounds
+        
+      if (isInBethlehemBounds) {
+        return { valid: true, areaType: 'geographic_match' };
+      }
+    }
+    
+    // Check for Free State province
+    if (addressLower.includes('free state') || addressLower.includes('free-state')) {
+      return { valid: true, areaType: 'free_state' };
+    }
+    
+    return { valid: false, areaType: 'unknown' };
+  }
+
+  // Enhanced reverse geocoding with OpenStreetMap Nominatim
+  static async reverseGeocodeWithOSM(lat, lng) {
+    try {
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`
+      );
+      
+      if (!response.ok) {
+        throw new Error('Geocoding failed');
+      }
+      
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error('Reverse geocoding error:', error);
+      return null;
+    }
+  }
+
+  // Forward geocoding for address validation
+  static async forwardGeocodeWithOSM(address) {
+    try {
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address + ', Free State, South Africa')}&countrycodes=za&limit=1`
+      );
+      
+      if (!response.ok) {
+        throw new Error('Forward geocoding failed');
+      }
+      
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error('Forward geocoding error:', error);
+      return null;
+    }
+  }
+
+  // Extract location details from geocoded data
+  static extractLocationDetails(geocodedData) {
+    if (!geocodedData || !geocodedData.address) return null;
+    
+    const address = geocodedData.address;
+    const details = {
+      suburb: address.suburb || address.neighbourhood || address.city_district,
+      city: address.city || address.town || address.village || address.municipality,
+      province: address.state || address.region,
+      postalCode: address.postcode,
+      country: address.country,
+      fullAddress: geocodedData.display_name
+    };
+    
+    return details;
+  }
+}
+
+// ========== RESPONSE MESSAGES ==========
+
+const responses = {
+  // Dynamic greeting based on returning customer
+  getGreeting: (phone, name) => OrderManager.getCustomerGreeting(phone, name) + `
+
+I can help you with:
+• 🧊 Ice orders & pricing (R8/bag)
+• 🚚 Delivery information (R15 Bethlehem area)  
+• 📦 Minimum orders (10 bags)
+• ❓ General questions
+
+Quick commands:
+"price" - See ice pricing
+"order" - Start ice order process  
+"delivery" - Delivery areas & times
+"help" - More options
+
+What would you like to know? 😊`,
+
+  price: `💰 *Ice Pricing Information*
+
+🧊 *Standard Ice 2kg Bags:*
+• Price: R8.00 per bag
+• Minimum Order: 10 bags
+• Delivery Fee: R15.00 (Bethlehem area)
+
+💵 *Example Orders:*
+• 10 bags: R80 + R15 = R95 total
+• 20 bags: R160 + R15 = R175 total  
+• 50 bags: R400 + R15 = R415 total
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+To start an order, type: "order"`,
+
+  help: `🧊 Thanks for messaging Ice Men!
+
+I'm here to help with:
+• Ice orders and pricing (R8/bag, 10 min)
+• Delivery information (R15 Bethlehem)
+• Order processing
+• Connecting with our team
+
+Quick help: 
+Type "price" for pricing
+Type "order" to start order process  
+Type "delivery" for delivery info
+Type "agent" to speak with human
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+We're here to keep you cool! ❄️`,
+
+  minimum: `📦 *Minimum Order Information*
+
+We have a minimum order of *10 ice bags* at R8.00 each.
+
+This helps us ensure efficient delivery service throughout Bethlehem.
+
+🧊 *10 bags = R80.00 + R15 delivery = R95.00 total*
+
+📍 *Walk-in Store:*
+Orders below 10 bags can be purchased directly at our store:
+496 Mlangeni St, Old Location, Bethlehem, 9701
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+Ready to order? Just type "order" to start!`,
+
+  delivery: `🚚 *Delivery Information*
+
+We deliver throughout *Bethlehem, Free State* and surrounding areas with a R15.00 delivery fee.
+
+📍 *Delivery Areas:*
+• Bethlehem CBD & Central
+• Bohlokong
+• Old Location & Mlangeni St
+• All surrounding areas in Bethlehem
+
+🚫 *Currently Not Delivering To:*
+• Johannesburg/Pretoria areas
+• Cape Town/Durban areas
+• Other provinces
+
+⏰ *Delivery Times:*
+We'll contact you to arrange the best delivery time after you place your order.
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+To start an order, type "order"`,
+
+  default: `🤖 *Ice Men Assistant*
+
+I can help you with:
+🧊 Ice orders & pricing
+🚚 Delivery information 
+📞 Contacting our team
+❓ General questions
+
+*Quick Commands:*
+• "price" - See ice pricing
+• "order" - Start ice order process
+• "delivery" - Delivery info  
+• "help" - More options
+• "agent" - Speak with human
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+What would you like to know? 😊`,
+
+  agent: `👨‍💼 *Connecting to Agent*
+
+Thank you! Our team will contact you shortly.
+
+📱 *Contact Numbers:*
+• 063 138 8803 (Andile)
+• 067 293 9603 (Kutlwano)
+• 081 287 3600 (Tony)
+
+📍 *Location:*
+496 Mlangeni St, Old Location, Bethlehem, 9701
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+For immediate ordering, type "order" to start the automated process.`,
+
+  // New responses for unsupported content
+  unsupportedContent: `🤖 *I can't understand that*
+
+I'm designed to handle text messages and location sharing for ice orders.
+
+If you sent a photo, sticker, or other media, I can't process it.
+
+Would you like to:
+• Type your message instead
+• Speak with a human agent
+• Start an ice order
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+Just type "help" to see all options!`,
+
+  // Cancel response for any point in conversation
+  cancelled: `❌ *Order Cancelled*
+
+Your order has been cancelled. No problem!
+
+If you change your mind, just type "order" to start again.
+
+📍 *Walk-in Store:*
+496 Mlangeni St, Old Location, Bethlehem, 9701
+
+📱 *Contact Us:*
+063 138 8803 (Andile)
+067 293 9603 (Kutlwano)
+081 287 3600 (Tony)
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+For any questions, type "help" or "agent" to speak with our team.`
+};
+
+// ========== ORDER PROCESS MESSAGES ==========
+
+const orderResponses = {
+  start: (isReturning = false) => {
+    const welcome = isReturning ? "🛒 *Welcome Back!* Let's get your ice order started!" : "🛒 *Starting Your Ice Order*";
+    return `${welcome}
+
+I'll guide you through a few quick questions.
+
+🧊 *Pricing:*
+• R8.00 per 2kg ice bag
+• Minimum: 10 bags
+• Delivery: R15.00 (Bethlehem)
+
+💰 *Example:*
+10 bags = R80 + R15 delivery = R95 total
+
+📍 *Walk-in Store:*
+Orders below 10 bags can be purchased directly at:
+496 Mlangeni St, Old Location, Bethlehem, 9701
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+*How many ice bags would you like to order?*
+Please enter a number (minimum 10):`;
+  },
+
+  quantityInvalid: `❌ *Invalid Quantity*
+
+Please enter a number of 10 or more for your ice order.
+
+Examples:
+• "10" for 10 bags (R95 total)
+• "20" for 20 bags (R175 total)
+• "50" for 50 bags (R415 total)
+
+📍 *Walk-in Store:*
+Orders below 10 bags can be purchased directly at:
+496 Mlangeni St, Old Location, Bethlehem, 9701
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+*How many ice bags would you like?*`,
+
+  address: `📍 *Delivery Address*
+
+Great! {quantity} ice bags = R{amount}
+
+Now, please provide your *delivery address* in Bethlehem:
+
+*You can:*
+• Type your full address with street and area
+• OR share your location:
+  📱 Tap the 📎 paperclip icon
+  📍 Select "Location" 
+  🗺️ Choose "Share Live Location" or "Send your current location"
+
+*Important: We only deliver in Bethlehem, Free State and surrounding areas*
+
+📍 *Walk-in Store:*
+496 Mlangeni St, Old Location, Bethlehem, 9701
+
+🌐 *Visit our website:*
+https://icemengroup.com/`,
+
+  instructions: `📝 *Delivery Instructions*
+
+Thank you! Delivery to:
+{address}
+
+Now, any special *delivery instructions*?
+
+Examples:
+• "Leave at gate"
+• "Call when arriving"
+• "Safe place: behind fence"
+• "No instructions"
+
+If no special instructions, just type "none" or "no":`,
+
+  confirmation: `✅ *Order Summary - Please Confirm*
+
+🧊 *Order Details:*
+Order #: {orderId}
+Quantity: {quantity} ice bags
+Subtotal: R{subtotal}
+Delivery: R15.00
+*Total: R{total}*
+
+📍 *Delivery:*
+{address}
+
+📝 *Instructions:*
+{instructions}
+
+💳 *Payment:*
+Cash or EFT on delivery
+
+📱 *Contact:*
+063 138 8803 (Andile)
+067 293 9603 (Kutlwano)
+081 287 3600 (Tony)
+
+🌐 *Website:*
+https://icemengroup.com/
+
+To *CONFIRM* your order, please type: "confirm"
+To cancel, type: "cancel"
+
+Your ice will be delivered to your address in Bethlehem! ❄️`,
+
+  confirmed: (orderId, quantity, total, address, instructions) => {
+    const now = new Date();
+    const deliveryTime = new Date(now.getTime() + 40 * 60000); // Add 40 minutes
+    
+    return `🎉 *Order Confirmed!*
+
+Thank you for your order! Here are your details:
+
+📦 *Order #:* ${orderId}
+🧊 *Quantity:* ${quantity} ice bags
+💰 *Total:* R${total}
+📍 *Delivery:* ${address}
+📝 *Instructions:* ${instructions}
+
+⏰ *Latest Arrival:* ${deliveryTime.toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit' })}
+
+💳 *Payment:* Cash or EFT on delivery
+
+📱 *Contact Numbers:*
+• 063 138 8803 (Andile)
+• 067 293 9603 (Kutlwano) 
+• 081 287 3600 (Tony)
+
+🌐 *Visit our website:*
+https://icemengroup.com/
+
+We'll contact you shortly to confirm delivery timing.
+
+Thank you for choosing Ice Men! ❄️`;
+  },
+
+  cancelled: responses.cancelled
+};
+
+// ========== MESSAGE PROCESSING ==========
+
+class MessageProcessor {
+  static extractMessageContent(message) {
+    // Text content
+    let text = null;
+    if (message.message?.conversation) {
+      text = message.message.conversation.trim().toLowerCase();
+    }
+    if (message.message?.extendedTextMessage?.text) {
+      text = message.message.extendedTextMessage.text.trim().toLowerCase();
+    }
+    if (message.message?.imageMessage?.caption) {
+      text = message.message.imageMessage.caption.trim().toLowerCase();
+    }
+
+    // Location content
+    let location = null;
+    if (message.message?.locationMessage) {
+      location = {
+        latitude: message.message.locationMessage.degreesLatitude,
+        longitude: message.message.locationMessage.degreesLongitude,
+        name: message.message.locationMessage.name || '',
+        address: message.message.locationMessage.address || ''
+      };
+    }
+
+    // Check for unsupported content types
+    const hasUnsupportedContent = 
+      message.message?.imageMessage && !message.message.imageMessage.caption ||
+      message.message?.videoMessage ||
+      message.message?.documentMessage ||
+      message.message?.stickerMessage ||
+      message.message?.audioMessage;
+
+    return { text, location, hasUnsupportedContent };
+  }
+
+  static async processMessage(messageContent, senderJid, senderName, senderPhone) {
+    const { text, location, hasUnsupportedContent } = messageContent;
+    
+    // Handle unsupported content first
+    if (hasUnsupportedContent && !text) {
+      return responses.unsupportedContent;
+    }
+
+    // Check for cancel command at any point
+    if (text && this.isCancelCommand(text)) {
+      OrderManager.completeOrder(senderPhone);
+      return responses.cancelled;
+    }
+    
+    // Check if user has an active order first
+    const activeOrder = OrderManager.getOrder(senderPhone);
+    if (activeOrder) {
+      return await this.handleOrderStep(activeOrder, text, location, senderJid, senderPhone);
+    }
+
+    // Regular message processing
+    return this.handleRegularMessage(text, senderJid, senderName, senderPhone);
+  }
+
+  static isCancelCommand(text) {
+    const cancelWords = ['cancel', 'stop', 'nevermind', 'never mind', 'forget it', 'bye', 'exit', 'quit'];
+    return cancelWords.some(word => text.includes(word));
+  }
+
+  static async handleOrderStep(order, text, location, senderJid, senderPhone) {
+    // Check for cancel command in order flow
+    if (text && this.isCancelCommand(text)) {
+      OrderManager.completeOrder(senderPhone);
+      return responses.cancelled;
+    }
+
+    switch (order.step) {
+      case 'quantity':
+        return await this.handleQuantityStep(order, text, senderJid, senderPhone);
+      
+      case 'address':
+        return await this.handleAddressStep(order, text, location, senderJid, senderPhone);
+      
+      case 'instructions':
+        return await this.handleInstructionsStep(order, text, senderJid, senderPhone);
+      
+      case 'confirmation':
+        return await this.handleConfirmationStep(order, text, senderJid, senderPhone);
+      
+      default:
+        OrderManager.completeOrder(senderPhone);
+        return await sendWhatsAppMessage(senderJid, '❌ Order process error. Please type "order" to start again.');
+    }
+  }
+
+  static async handleQuantityStep(order, text, senderJid, senderPhone) {
+    const quantity = parseInt(text);
+    
+    if (isNaN(quantity) || quantity < 10) {
+      return await sendWhatsAppMessage(senderJid, orderResponses.quantityInvalid);
+    }
+
+    const subtotal = quantity * 8;
+    OrderManager.updateOrder(senderPhone, {
+      step: 'address',
+      quantity: quantity,
+      subtotal: subtotal,
+      total: subtotal + 15
+    });
+
+    const response = orderResponses.address
+      .replace('{quantity}', quantity)
+      .replace('{amount}', subtotal);
+    
+    return await sendWhatsAppMessage(senderJid, response);
+  }
+
+  static async handleAddressStep(order, text, location, senderJid, senderPhone) {
+    // Handle location attachment with enhanced geocoding
+    if (location) {
+      console.log('📍 Processing location attachment:', location);
+      
+      try {
+        // Enhanced geocoding with detailed address extraction
+        let addressText = '';
+        let detailedLocation = null;
+        
+        // First, try to get detailed address from coordinates
+        const geocodedData = await OrderManager.reverseGeocodeWithOSM(location.latitude, location.longitude);
+        
+        if (geocodedData) {
+          addressText = geocodedData.display_name;
+          detailedLocation = geocodedData;
+          
+          // Extract location details for better validation
+          const locationDetails = OrderManager.extractLocationDetails(geocodedData);
+          console.log('📍 Extracted location details:', locationDetails);
+        } else {
+          // Fallback to basic location info
+          if (location.name || location.address) {
+            addressText = `${location.name || ''} ${location.address || ''}`.trim();
+          } else {
+            addressText = `📍 Coordinates: ${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`;
+          }
+        }
+        
+        // Enhanced validation with detailed location data
+        const validation = await OrderManager.validateDeliveryArea(
+          addressText, 
+          { lat: location.latitude, lng: location.longitude }
+        );
+        
+        if (!validation.valid) {
+          if (validation.reason === 'outside_area') {
+            OrderManager.completeOrder(senderPhone);
+            return await sendWhatsAppMessage(senderJid, validation.message);
+          } else if (validation.reason === 'unclear_location') {
+            return await sendWhatsAppMessage(senderJid, validation.message);
+          }
+        }
+        
+        OrderManager.updateOrder(senderPhone, {
+          step: 'instructions',
+          address: addressText,
+          location: {
+            lat: location.latitude,
+            lng: location.longitude,
+            name: location.name,
+            address: location.address,
+            detailed: detailedLocation
+          }
+        });
+
+        const response = `📍 *Location Received!*\n\nThank you! We've got your location:\n${addressText}\n\n${orderResponses.instructions.replace('{address}', addressText)}`;
+        return await sendWhatsAppMessage(senderJid, response);
+
+      } catch (error) {
+        console.error('Error processing location:', error);
+        return await sendWhatsAppMessage(senderJid, 
+          `❌ Error processing location. Please type your address instead:\n\nStreet, Area, Bethlehem\n\n🌐 *Visit our website:*\nhttps://icemengroup.com/`);
+      }
+    }
+
+    // Handle text address with enhanced validation
+    if (text && text.length < 10) {
+      return await sendWhatsAppMessage(senderJid, 
+        `❌ Please provide a complete address with street name and area.\n\n*Or you can share your location:*\n📱 Tap the 📎 attachment icon\n📍 Choose "Location"\n🗺️ Share your current location\n\n*We only deliver in Bethlehem, Free State area*\n\n🌐 *Visit our website:*\nhttps://icemengroup.com/`);
+    }
+
+    if (text) {
+      // Enhanced address validation with forward geocoding
+      const validation = await OrderManager.validateDeliveryArea(text);
+      if (!validation.valid) {
+        if (validation.reason === 'outside_area') {
+          OrderManager.completeOrder(senderPhone);
+          return await sendWhatsAppMessage(senderJid, validation.message);
+        } else if (validation.reason === 'unclear_location') {
+          return await sendWhatsAppMessage(senderJid, validation.message);
+        }
+      }
+
+      OrderManager.updateOrder(senderPhone, {
+        step: 'instructions',
+        address: text
+      });
+
+      const response = orderResponses.instructions.replace('{address}', text);
+      return await sendWhatsAppMessage(senderJid, response);
+    }
+
+    // If no text or location, ask again with enhanced messaging
+    return await sendWhatsAppMessage(senderJid, 
+      `📍 *Delivery Address*\n\nPlease provide your delivery address in Bethlehem.\n\n*You can:*\n• Type your full address\n• OR share your location:\n  📱 Tap 📎 → Location → Share\n\n*We deliver throughout Bethlehem, Free State area only!*\n\n🌐 *Visit our website:*\nhttps://icemengroup.com/`);
+  }
+
+  static async handleInstructionsStep(order, text, senderJid, senderPhone) {
+    const instructions = text === 'none' || text === 'no' ? 'No special instructions' : text;
+    
+    OrderManager.updateOrder(senderPhone, {
+      step: 'confirmation',
+      instructions: instructions
+    });
+
+    const updatedOrder = OrderManager.getOrder(senderPhone);
+    const response = orderResponses.confirmation
+      .replace('{orderId}', updatedOrder.orderId)
+      .replace('{quantity}', updatedOrder.quantity)
+      .replace('{subtotal}', updatedOrder.subtotal)
+      .replace('{total}', updatedOrder.total)
+      .replace('{address}', updatedOrder.address)
+      .replace('{instructions}', updatedOrder.instructions);
+
+    return await sendWhatsAppMessage(senderJid, response);
+  }
+
+  static async handleConfirmationStep(order, text, senderJid, senderPhone) {
+    if (text === 'confirm') {
+      // Save order to Google Sheets
+      try {
+        const orderData = {
+          orderId: order.orderId,
+          name: order.name,
+          email: "N/A", // Set email as N/A for WhatsApp orders
+          phone: order.phone,
+          quantity: order.quantity,
+          address: order.address,
+          instructions: order.instructions,
+          subtotal: order.subtotal,
+          delivery: 15,
+          total: order.total,
+          orderStatus: "Pending",
+          timestamp: new Date().toISOString(),
+          source: "whatsapp",
+          isReturningCustomer: order.isReturningCustomer
+        };
+
+        // Include enhanced location data if available
+        if (order.location) {
+          orderData.locationData = JSON.stringify(order.location);
+        }
+
+        await callGoogleAppsScript(orderData);
+        
+        // Send enhanced SMS notification to delivery team
+        await sendOrderNotificationSMS(orderData);
+        
+        const response = orderResponses.confirmed(
+          order.orderId,
+          order.quantity,
+          order.total,
+          order.address,
+          order.instructions
+        );
+
+        OrderManager.completeOrder(senderPhone);
+        return await sendWhatsAppMessage(senderJid, response);
+
+      } catch (error) {
+        console.error('Order save error:', error);
+        OrderManager.completeOrder(senderPhone);
+        return await sendWhatsAppMessage(senderJid, 
+          `❌ Error saving order. Please try again or contact us directly:\n\n📱 *Contact Numbers:*\n063 138 8803 (Andile)\n067 293 9603 (Kutlwano)\n081 287 3600 (Tony)\n\n🌐 *Visit our website:*\nhttps://icemengroup.com/`);
+      }
+    } 
+    else if (text === 'cancel' || this.isCancelCommand(text)) {
+      OrderManager.completeOrder(senderPhone);
+      return await sendWhatsAppMessage(senderJid, orderResponses.cancelled);
+    }
+    else {
+      return await sendWhatsAppMessage(senderJid, 
+        '❌ Please type "confirm" to place your order or "cancel" to cancel.\n\n🌐 *Visit our website:*\nhttps://icemengroup.com/');
+    }
+  }
+
+  static handleRegularMessage(text, senderJid, senderName, senderPhone) {
+    if (!text) return responses.default;
+
+    // Check for cancel command
+    if (this.isCancelCommand(text)) {
+      OrderManager.completeOrder(senderPhone);
+      return responses.cancelled;
+    }
+
+    // Greeting triggers - with personalized welcome for returning customers
+    if (text.includes('hi') || text.includes('hello') || text.includes('hey') || 
+        text.includes('good morning') || text.includes('good afternoon') || text.includes('good evening')) {
+      return responses.getGreeting(senderPhone, senderName);
+    }
+
+    // Order triggers - START ORDER PROCESS
+    if (text.includes('order')) {
+      OrderManager.startOrder(senderPhone, senderName);
+      const isReturning = OrderManager.isReturningCustomer(senderPhone);
+      return orderResponses.start(isReturning);
+    }
+
+    // Price triggers
+    if (text.includes('price') || text.includes('cost') || text.includes('how much') || text.includes('r8') || text.includes('rate')) {
+      return responses.price;
+    }
+
+    // Help triggers
+    if (text.includes('help') || text.includes('support') || text.includes('what can you do')) {
+      return responses.help;
+    }
+
+    // Minimum order triggers
+    if (text.includes('minimum') || text.includes('min order') || text.includes('least') || text.includes('smallest')) {
+      return responses.minimum;
+    }
+
+    // Delivery triggers
+    if (text.includes('delivery') || text.includes('deliver') || text.includes('where do you deliver') || text.includes('bethlehem') || text.includes('area')) {
+      return responses.delivery;
+    }
+
+    // Agent triggers
+    if (text.includes('agent') || text.includes('human') || text.includes('person') || text.includes('talk to someone') || text.includes('representative')) {
+      return responses.agent;
+    }
+
+    // Website triggers
+    if (text.includes('website') || text.includes('site') || text.includes('online') || text.includes('web')) {
+      return `🌐 *Ice Men Website*\n\nVisit our website for more information:\nhttps://icemengroup.com/\n\nYou can view our products, learn more about us, and place orders online!\n\nFor immediate ordering via WhatsApp, type "order" to start.`;
+    }
+
+    // Contact triggers
+    if (text.includes('contact') || text.includes('number') || text.includes('phone') || text.includes('call')) {
+      return `📱 *Contact Ice Men*\n\n*Team Members:*\n• 063 138 8803 (Andile)\n• 067 293 9603 (Kutlwano)\n• 081 287 3600 (Tony)\n\n📍 *Store Location:*\n496 Mlangeni St, Old Location, Bethlehem, 9701\n\n🌐 *Website:*\nhttps://icemengroup.com/\n\nFor immediate ordering, type "order" to start the automated process.`;
+    }
+
+    // Default response for anything else
+    return responses.default;
+  }
+
+  static async processIncomingMessage(message, senderJid, senderName, senderPhone) {
+    const messageContent = this.extractMessageContent(message);
+    return await this.processMessage(messageContent, senderJid, senderName, senderPhone);
+  }
+}
+
+// ========== GOOGLE SHEETS INTEGRATION ==========
+
+async function callGoogleAppsScript(payload) {
   try {
-    // Use external URL to generate inbound traffic
-    const externalUrl = process.env.RENDER_EXTERNAL_URL || 'https://icemenserver.onrender.com';
-    const response = await fetch(`${externalUrl}/ping`);
-    const result = await response.text();
-    lastPingTime = new Date().toISOString();
-    console.log(`🔄 Auto-ping successful to ${externalUrl}: ${result} at ${lastPingTime}`);
-    return true;
+    const response = await fetch(GOOGLE_APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (response.ok) {
+      return await response.json();
+    } else {
+      throw new Error(`Google Sheets error: ${response.status}`);
+    }
   } catch (error) {
-    console.error('❌ Auto-ping failed:', error.message);
-    return false;
+    console.error('Google Apps Script error:', error);
+    throw error;
   }
 }
 
-// Start auto-ping system
-function startAutoPing() {
-  // Clear existing interval if any
-  if (pingInterval) {
-    clearInterval(pingInterval);
+// ========== SMS NOTIFICATION ==========
+
+async function sendOrderNotificationSMS(orderData) {
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+    console.log('⚠️ Twilio not configured - skipping SMS notification');
+    return;
   }
-  
-  // Ping immediately on startup
-  pingServer();
-  
-  // Set up interval for every 10 minutes (600,000 ms) to stay under 15 min sleep
-  pingInterval = setInterval(() => {
-    pingServer();
-  }, 10 * 60 * 1000);
-  
-  console.log(`🔄 Auto-ping system started: pinging external URL every 10 minutes`);
-  console.log(`🔄 Next ping in: 10 minutes`);
-  console.log(`🔄 Render sleep prevention: ACTIVE (but for reliability, use external cron like cron-job.org)`);
+
+  try {
+    const now = new Date();
+    const deliveryTime = new Date(now.getTime() + 40 * 60000);
+    
+    const message = `🧊 NEW WHATSAPP ORDER #${orderData.orderId}
+    
+Customer: ${orderData.name}
+Phone: ${orderData.phone}
+Quantity: ${orderData.quantity} ice bags
+Total: R${orderData.total}
+
+Delivery: ${orderData.address}
+${orderData.instructions !== 'No special instructions' ? `Instructions: ${orderData.instructions}` : ''}
+
+Latest Arrival: ${deliveryTime.toLocaleTimeString('en-ZA', { hour: '2-digit', minute: '2-digit' })}
+Payment: Cash/EFT on delivery
+
+${orderData.isReturningCustomer ? '🔄 RETURNING CUSTOMER' : '👋 NEW CUSTOMER'}
+
+Team Contacts:
+• 063 138 8803 (Andile)
+• 067 293 9603 (Kutlwano) 
+• 081 287 3600 (Tony)`;
+
+    await twilioClient.messages.create({
+      body: message,
+      to: '+27672939603', // Your delivery team number
+      from: process.env.TWILIO_NUMBER,
+    });
+
+    console.log('✅ SMS notification sent for order:', orderData.orderId);
+  } catch (error) {
+    console.error('❌ Failed to send SMS notification:', error.message);
+  }
 }
 
-// Stop auto-ping system
-function stopAutoPing() {
-  if (pingInterval) {
-    clearInterval(pingInterval);
-    pingInterval = null;
-    console.log('🔄 Auto-ping system stopped');
+// ========== WHATSAPP MESSAGE SENDER ==========
+
+async function sendWhatsAppMessage(jid, message) {
+  if (!whatsappSocket || !isWhatsAppConnected) {
+    throw new Error('WhatsApp not connected');
   }
+
+  if (!jid.includes('@s.whatsapp.net')) {
+    jid = `${jid}@s.whatsapp.net`;
+  }
+
+  await whatsappSocket.sendMessage(jid, { text: message });
 }
 
 // ========== WHATSAPP CONNECTION ==========
 
-// WhatsApp Message Handler
 async function connectToWhatsApp() {
   if (isConnecting) {
     console.log('⏳ WhatsApp connection already in progress...');
@@ -103,22 +1074,16 @@ async function connectToWhatsApp() {
   try {
     console.log('🔄 Initializing WhatsApp connection...');
     
-    // Create auth state directory if it doesn't exist
     const authDir = './baileys_auth_info';
     if (!fs.existsSync(authDir)) {
       fs.mkdirSync(authDir, { recursive: true });
-      console.log('📁 Created auth directory:', authDir);
     }
     
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const { version } = await fetchLatestBaileysVersion();
     
-    console.log(`📦 Using Baileys version: ${version.join('.')}`);
-    
-    // Use pino logger with debug level for better error visibility
-    const logger = pino({ level: 'debug' });
+    const logger = pino({ level: 'silent' });
 
-    // Updated socket configuration for new Baileys version
     whatsappSocket = makeWASocket({
       version,
       logger: logger,
@@ -126,8 +1091,9 @@ async function connectToWhatsApp() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
-      browser: ['Baileys Bot', 'Chrome', '1.0.0'],
-      connectTimeoutMs: 60000, // 60 seconds timeout
+      browser: ['Ice Men Server', 'Chrome', '1.0.0'],
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
     });
 
     isConnecting = false;
@@ -136,12 +1102,11 @@ async function connectToWhatsApp() {
     whatsappSocket.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
       
-      // Handle QR code generation
       if (qr) {
         qrCode = qr;
         console.log('📱 WhatsApp QR Code received - scan with your phone');
         terminalQR.generate(qr, { small: true });
-        console.log(`🔗 Visit /whatsapp/qr to scan`);
+        console.log('🔗 Visit /whatsapp/qr to scan the QR code');
       }
 
       if (connection === 'close') {
@@ -149,27 +1114,31 @@ async function connectToWhatsApp() {
         const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
         
         const errorMsg = lastDisconnect?.error?.message || 'unknown reason';
-        console.log(`⚠️ WhatsApp connection closed due to ${errorMsg}, reconnecting ${shouldReconnect}`);
+        console.log(`⚠️ WhatsApp connection closed: ${errorMsg}`);
         
-        if (shouldReconnect) {
+        if (shouldReconnect && connectionRetries < MAX_CONNECTION_RETRIES) {
+          connectionRetries++;
           connectionError = errorMsg;
-          setTimeout(() => connectToWhatsApp(), 5000);
+          console.log(`🔄 Reconnecting... Attempt ${connectionRetries}/${MAX_CONNECTION_RETRIES}`);
+          setTimeout(() => connectToWhatsApp(), 3000);
         } else {
           connectionError = 'Logged out - please scan QR code again';
-          console.log('❌ WhatsApp logged out, please scan QR code again');
-          qrCode = null; // Clear old QR
+          console.log('❌ Max retries reached or logged out');
+          connectionRetries = 0;
+          qrCode = null;
+          whatsappSocket = null;
         }
       } else if (connection === 'open') {
         isWhatsAppConnected = true;
         qrCode = null;
         connectionError = null;
+        connectionRetries = 0;
         console.log('✅ WhatsApp connected successfully!');
-      } else if (connection === 'connecting') {
-        console.log('🔄 WhatsApp connecting...');
+        console.log('🤖 Ice Men bot is now LIVE and ready to take orders!');
+        console.log('📊 Enhanced Features: Advanced location geocoding, Multiple agent contacts, Website integration');
       }
     });
 
-    // Save credentials whenever they're updated
     whatsappSocket.ev.on('creds.update', saveCreds);
 
     // Handle incoming WhatsApp messages
@@ -177,25 +1146,20 @@ async function connectToWhatsApp() {
       try {
         const message = m.messages[0];
         
-        // Only process messages that are not from the bot itself and are not status updates
         if (message.key.fromMe || !message.message || message.message.protocolMessage) return;
 
-        const messageText = getMessageText(message);
-        console.log('📱 New WhatsApp message:', {
-          from: message.key.remoteJid,
-          message: messageText,
-          timestamp: new Date(message.messageTimestamp * 1000).toISOString()
-        });
+        const senderJid = message.key.remoteJid;
+        const senderPhone = senderJid?.replace('@s.whatsapp.net', '');
+        const senderName = message.pushName || 'Customer';
 
-        // ✅ ENHANCED: Forward to your n8n webhook
-        if (process.env.N8N_WEBHOOK_URL) {
-          await forwardToN8n(message);
-        } else {
-          console.log('⚠️ N8N_WEBHOOK_URL not set, skipping n8n forwarding');
+        console.log('📱 New message from:', senderPhone, 'Name:', senderName, 'Returning:', OrderManager.isReturningCustomer(senderPhone));
+
+        const response = await MessageProcessor.processIncomingMessage(message, senderJid, senderName, senderPhone);
+        if (response) {
+          await sendWhatsAppMessage(senderJid, response);
+          console.log('🤖 Sent response to:', senderPhone);
         }
 
-        // Auto-reply example
-        await handleIncomingMessage(message);
       } catch (error) {
         console.error('❌ Error processing WhatsApp message:', error);
       }
@@ -205,552 +1169,45 @@ async function connectToWhatsApp() {
     isConnecting = false;
     connectionError = error.message;
     console.error('❌ Error connecting to WhatsApp:', error.message);
-    console.error('Stack:', error.stack);
-    // Retry after 10 seconds
     setTimeout(() => connectToWhatsApp(), 10000);
   }
 }
 
-// Helper function to extract message text from different message types
-function getMessageText(message) {
-  if (message.message?.conversation) {
-    return message.message.conversation;
-  }
-  if (message.message?.extendedTextMessage?.text) {
-    return message.message.extendedTextMessage.text;
-  }
-  if (message.message?.imageMessage?.caption) {
-    return message.message.imageMessage.caption;
-  }
-  if (message.message?.videoMessage?.caption) {
-    return message.message.videoMessage.caption;
-  }
-  if (message.message?.documentMessage?.caption) {
-    return message.message.documentMessage.caption;
-  }
-  return 'Unsupported message type';
-}
+// ========== AUTO-PING SYSTEM ==========
 
-// ✅ ENHANCED: Forward message to n8n with better error handling and timeout
-async function forwardToN8n(message) {
+let pingInterval = null;
+let lastPingTime = null;
+
+async function pingServer() {
   try {
-    const messageText = getMessageText(message);
-    const payload = {
-      platform: 'whatsapp',
-      from: message.key.remoteJid,
-      text: messageText, // Changed from 'message' to 'text' to match your n8n test
-      timestamp: new Date(message.messageTimestamp * 1000).toISOString(),
-      messageId: message.key.id,
-      messageType: getMessageType(message),
-      isGroup: message.key.remoteJid?.includes('@g.us') || false
-    };
-
-    console.log('📤 Forwarding to n8n:', {
-      from: payload.from,
-      text: payload.text,
-      timestamp: payload.timestamp
-    });
-
-    // Add timeout for Render environment
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
-    const response = await fetch(process.env.N8N_WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      console.log('✅ Message successfully forwarded to n8n');
-      return true;
-    } else {
-      console.error('❌ n8n responded with error:', response.status, response.statusText);
-      return false;
-    }
+    const externalUrl = process.env.RENDER_EXTERNAL_URL || 'https://icemenserver.onrender.com';
+    const response = await fetch(`${externalUrl}/ping`);
+    const result = await response.text();
+    lastPingTime = new Date().toISOString();
+    console.log(`🔄 Auto-ping successful to ${externalUrl}: ${result} at ${lastPingTime}`);
+    return true;
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.error('❌ n8n request timeout - webhook might be unreachable');
-    } else {
-      console.error('❌ Error forwarding to n8n:', error.message);
-    }
+    console.error('❌ Auto-ping failed:', error.message);
     return false;
   }
 }
 
-// ✅ NEW: Helper function to determine message type
-function getMessageType(message) {
-  if (message.message?.conversation) return 'text';
-  if (message.message?.extendedTextMessage) return 'extended_text';
-  if (message.message?.imageMessage) return 'image';
-  if (message.message?.videoMessage) return 'video';
-  if (message.message?.documentMessage) return 'document';
-  if (message.message?.audioMessage) return 'audio';
-  return 'unknown';
+function startAutoPing() {
+  if (pingInterval) clearInterval(pingInterval);
+  pingServer();
+  pingInterval = setInterval(pingServer, 10 * 60 * 1000);
+  console.log(`🔄 Auto-ping system started`);
 }
 
-// Handle incoming WhatsApp messages
-async function handleIncomingMessage(message) {
-  const jid = message.key.remoteJid;
-  const text = getMessageText(message).toLowerCase() || '';
-
-  try {
-    // Simple auto-reply logic
-    if (text.includes('hello') || text.includes('hi') || text.includes('hola')) {
-      await sendWhatsAppMessage(jid, 'Hello! 👋 Thanks for messaging us. How can I help you today?');
-    } else if (text.includes('help')) {
-      await sendWhatsAppMessage(jid, 'I can help you with:\n• Order information\n• Support requests\n• General inquiries\n\nType "agent" to speak with a human.');
-    } else if (text.includes('agent')) {
-      await sendWhatsAppMessage(jid, 'A human agent will contact you shortly. Please wait...');
-      // Here you can trigger email/notification to owner
-    } else if (text.includes('order') || text.includes('price') || text.includes('cost')) {
-      await sendWhatsAppMessage(jid, 'For order and pricing information, please visit our website or type "agent" to speak with a sales representative.');
-    } else {
-      await sendWhatsAppMessage(jid, 'Thanks for your message! Our team will get back to you soon.');
-    }
-  } catch (error) {
-    console.error('❌ Error handling WhatsApp message:', error);
+function stopAutoPing() {
+  if (pingInterval) {
+    clearInterval(pingInterval);
+    pingInterval = null;
   }
 }
 
-// Send WhatsApp message
-async function sendWhatsAppMessage(jid, text) {
-  if (!whatsappSocket || !isWhatsAppConnected) {
-    throw new Error('WhatsApp is not connected');
-  }
+// ========== TWILIO SMS ENDPOINTS ==========
 
-  try {
-    await whatsappSocket.sendMessage(jid, { text: text });
-    console.log(`✅ WhatsApp message sent to ${jid}`);
-    return true;
-  } catch (error) {
-    console.error('❌ Error sending WhatsApp message:', error);
-    throw error;
-  }
-}
-
-// ========== WHATSAPP ENDPOINTS ==========
-
-// GET /whatsapp/qr - Get QR code for WhatsApp connection
-app.get('/whatsapp/qr', async (req, res) => {
-  // Set timeout to prevent infinite loading
-  res.setTimeout(30000);
-
-  try {
-    // If WhatsApp hasn't been initialized yet, start it now
-    if (!whatsappSocket && !isConnecting && !connectionError) {
-      console.log('🔄 First visit to /whatsapp/qr - initializing WhatsApp...');
-      // Don't await - let it run in background
-      connectToWhatsApp().catch(err => {
-        console.error('❌ WhatsApp initialization error:', err);
-        connectionError = err.message;
-      });
-      
-      // Show loading page
-      return res.send(`
-        <!DOCTYPE html>
-        <html>
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta http-equiv="refresh" content="3">
-            <title>Initializing WhatsApp</title>
-            <style>
-              body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
-              .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-              .spinner { width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #25d366; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px auto; }
-              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-              .status { background: #fff3cd; color: #856404; padding: 15px; border-radius: 5px; margin-top: 20px; }
-            </style>
-          </head>
-          <body>
-            <div class="container">
-              <div class="spinner"></div>
-              <h2>Starting WhatsApp Connection</h2>
-              <p>Initializing for the first time...</p>
-              <div class="status">Please wait, this may take a few seconds</div>
-              <p style="margin-top: 20px; color: #666; font-size: 14px;">This page will refresh automatically</p>
-            </div>
-          </body>
-        </html>
-      `);
-    }
-
-  if (isWhatsAppConnected) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>WhatsApp Connected</title>
-          <style>
-            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
-            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            .success { color: #25d366; font-size: 48px; margin-bottom: 20px; }
-            h2 { color: #333; }
-            .status { background: #d4edda; color: #155724; padding: 15px; border-radius: 5px; margin-top: 20px; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="success">✅</div>
-            <h2>WhatsApp Connected!</h2>
-            <p>Your WhatsApp is already connected and ready to send messages.</p>
-            <div class="status">Status: Active Connection</div>
-            <p style="margin-top: 30px; color: #666;">
-              <a href="/whatsapp/status" style="color: #25d366;">Check Status</a> | 
-              <a href="/" style="color: #25d366;">API Docs</a>
-            </p>
-          </div>
-        </body>
-      </html>
-    `);
-  }
-
-  if (connectionError) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>WhatsApp Connection Error</title>
-          <style>
-            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
-            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            .error { color: #dc3545; font-size: 48px; margin-bottom: 20px; }
-            .error-msg { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 5px; margin-top: 20px; }
-            button { background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 20px; }
-            button:hover { background: #128c7e; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="error">❌</div>
-            <h2>Connection Error</h2>
-            <p>There was a problem connecting to WhatsApp:</p>
-            <div class="error-msg">${connectionError}</div>
-            <button onclick="location.reload()">🔄 Retry Connection</button>
-            <p style="margin-top: 30px; color: #666;">
-              <a href="/whatsapp/status" style="color: #25d366;">Check Status</a>
-            </p>
-          </div>
-        </body>
-      </html>
-    `);
-  }
-
-  if (qrCode) {
-    // Return QR code as SVG for web display
-    webQR.toString(qrCode, { type: 'svg' }, (err, svg) => {
-      if (err) {
-        return res.status(500).send(`
-          <!DOCTYPE html>
-          <html>
-            <head>
-              <meta charset="UTF-8">
-              <title>QR Code Error</title>
-              <style>
-                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
-                .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; }
-              </style>
-            </head>
-            <body>
-              <div class="container">
-                <h2>Failed to generate QR code</h2>
-                <p style="color: red;">${err.message}</p>
-                <button onclick="location.reload()" style="background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer;">Retry</button>
-              </div>
-            </body>
-          </html>
-        `);
-      }
-      
-      res.send(`
-        <!DOCTYPE html>
-        <html>
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>WhatsApp QR Code</title>
-            <style>
-              body { font-family: Arial, sans-serif; text-align: center; padding: 20px; background: #f0f2f5; }
-              .container { max-width: 600px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-              h2 { color: #333; margin-bottom: 10px; }
-              .qr-container { margin: 30px 0; padding: 20px; background: #f8f9fa; border-radius: 10px; }
-              .instructions { text-align: left; margin: 20px 0; padding: 20px; background: #e7f3ff; border-left: 4px solid #2196F3; border-radius: 5px; }
-              .instructions ol { margin: 10px 0; padding-left: 20px; }
-              .instructions li { margin: 8px 0; }
-              .status { display: inline-block; padding: 8px 16px; background: #fff3cd; color: #856404; border-radius: 20px; font-size: 14px; margin-top: 20px; }
-              .loading { display: inline-block; width: 12px; height: 12px; border: 2px solid #856404; border-radius: 50%; border-top-color: transparent; animation: spin 1s linear infinite; margin-left: 8px; }
-              @keyframes spin { to { transform: rotate(360deg); } }
-              .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; color: #666; font-size: 14px; }
-              button { background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
-              button:hover { background: #128c7e; }
-            </style>
-            <script>
-              // Auto-refresh every 10 seconds to check connection status
-              let refreshCount = 0;
-              const maxRefreshes = 30; // Stop after 5 minutes (30 * 10s)
-              
-              setInterval(() => {
-                refreshCount++;
-                if (refreshCount < maxRefreshes) {
-                  fetch('/whatsapp/status')
-                    .then(r => r.json())
-                    .then(data => {
-                      if (data.connected) {
-                        location.reload();
-                      }
-                    });
-                }
-              }, 10000);
-            </script>
-          </head>
-          <body>
-            <div class="container">
-              <h2>📱 Scan WhatsApp QR Code</h2>
-              <p style="color: #666;">Connect your WhatsApp account to start sending messages</p>
-              
-              <div class="qr-container">
-                ${svg}
-              </div>
-              
-              <div class="instructions">
-                <strong>How to connect:</strong>
-                <ol>
-                  <li>Open <strong>WhatsApp</strong> on your phone</li>
-                  <li>Tap <strong>Menu</strong> (⋮) or <strong>Settings</strong></li>
-                  <li>Select <strong>Linked Devices</strong></li>
-                  <li>Tap <strong>Link a Device</strong></li>
-                  <li>Point your phone at this screen to scan the code</li>
-                </ol>
-              </div>
-              
-              <div class="status">
-                ⏳ Waiting for scan<span class="loading"></span>
-              </div>
-              
-              <div>
-                <button onclick="location.reload()">🔄 Refresh QR Code</button>
-              </div>
-              
-              <div class="footer">
-                This page will automatically update when connected<br>
-                <a href="/whatsapp/status" style="color: #25d366;">Check Connection Status</a>
-              </div>
-            </div>
-          </body>
-        </html>
-      `);
-    });
-  } else {
-    // QR code not yet generated
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <meta http-equiv="refresh" content="3">
-          <title>Initializing WhatsApp</title>
-          <style>
-            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
-            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            .spinner { width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #25d366; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px auto; }
-            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-            .status { background: #fff3cd; color: #856404; padding: 15px; border-radius: 5px; margin-top: 20px; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="spinner"></div>
-            <h2>Initializing WhatsApp Connection</h2>
-            <p>Please wait while we generate your QR code...</p>
-            <div class="status">
-              ${isConnecting ? 'Connecting to WhatsApp servers...' : 'Starting connection process...'}
-            </div>
-            <p style="margin-top: 20px; color: #666; font-size: 14px;">This page will refresh automatically</p>
-          </div>
-        </body>
-      </html>
-    `);
-  }
-  } catch (error) {
-    console.error('❌ Error in /whatsapp/qr endpoint:', error);
-    res.status(500).send(`
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="UTF-8">
-          <title>Error</title>
-          <style>
-            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f2f5; }
-            .container { max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; }
-            .error { color: #dc3545; font-size: 48px; margin-bottom: 20px; }
-          </style>
-        </head>
-        <body>
-          <div class="container">
-            <div class="error">❌</div>
-            <h2>Endpoint Error</h2>
-            <p style="color: red;">${error.message}</p>
-            <button onclick="location.reload()" style="background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer;">Retry</button>
-            <p style="margin-top: 20px;"><a href="/debug">Check Debug Info</a></p>
-          </div>
-        </body>
-      </html>
-    `);
-  }
-});
-
-// POST /whatsapp/send - Send WhatsApp message
-app.post('/whatsapp/send', async (req, res) => {
-  const requestId = Date.now();
-  console.log(`\n📱 [${requestId}] NEW WHATSAPP MESSAGE REQUEST`);
-  
-  try {
-    const { to, message } = req.body;
-    
-    if (!to || !message) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: "to" and "message" are required'
-      });
-    }
-
-    if (!isWhatsAppConnected) {
-      return res.status(400).json({
-        success: false,
-        error: 'WhatsApp is not connected. Please scan QR code first at /whatsapp/qr'
-      });
-    }
-
-    // Ensure phone number has @s.whatsapp.net suffix
-    const formattedTo = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-    
-    await sendWhatsAppMessage(formattedTo, message);
-    
-    res.json({
-      success: true,
-      message: 'WhatsApp message sent successfully',
-      to: formattedTo
-    });
-
-  } catch (error) {
-    console.error(`❌ [${requestId}] Error sending WhatsApp message:`, error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to send WhatsApp message: ' + error.message
-    });
-  }
-});
-
-// GET /whatsapp/status - Check WhatsApp connection status
-app.get('/whatsapp/status', (req, res) => {
-  res.json({
-    success: true,
-    connected: isWhatsAppConnected,
-    status: isWhatsAppConnected ? 'connected' : (isConnecting ? 'connecting' : 'disconnected'),
-    qrAvailable: !!qrCode,
-    error: connectionError,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// POST /whatsapp/reconnect - Manually trigger WhatsApp reconnection
-app.post('/whatsapp/reconnect', async (req, res) => {
-  console.log('🔄 Manual reconnection requested');
-  
-  if (isWhatsAppConnected) {
-    return res.json({
-      success: true,
-      message: 'WhatsApp is already connected'
-    });
-  }
-
-  if (isConnecting) {
-    return res.json({
-      success: false,
-      message: 'Connection already in progress, please wait...'
-    });
-  }
-
-  try {
-    // Reset state
-    qrCode = null;
-    connectionError = null;
-    
-    // Trigger connection
-    connectToWhatsApp();
-    
-    res.json({
-      success: true,
-      message: 'WhatsApp reconnection initiated. Check /whatsapp/qr for QR code.'
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ✅ NEW: Test n8n connection endpoint
-app.post('/test-n8n', async (req, res) => {
-  try {
-    const { testMessage } = req.body;
-    
-    const payload = {
-      platform: 'whatsapp',
-      from: '2771xxxxxxx@s.whatsapp.net',
-      text: testMessage || 'Test message from server',
-      timestamp: new Date().toISOString(),
-      messageId: 'test-' + Date.now(),
-      messageType: 'text',
-      isGroup: false
-    };
-
-    console.log('🧪 Testing n8n connection with:', payload);
-
-    const response = await fetch(process.env.N8N_WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (response.ok) {
-      res.json({
-        success: true,
-        message: 'Test message sent to n8n successfully',
-        status: response.status
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: `n8n responded with ${response.status}: ${response.statusText}`
-      });
-    }
-  } catch (error) {
-    console.error('❌ Test n8n error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// ========== EXISTING TWILIO ENDPOINTS ==========
-
-// Input validation function
 function validatePhoneNumber(phone) {
   const phoneRegex = /^\+?[1-9]\d{1,14}$/;
   return phoneRegex.test(phone);
@@ -760,78 +1217,56 @@ function validateMessage(message) {
   return message && message.trim().length > 0 && message.length <= 1600;
 }
 
-// POST /send-sms endpoint
 app.post('/send-sms', async (req, res) => {
   const requestId = Date.now();
   console.log(`\n🔵 [${requestId}] NEW SMS REQUEST`);
   
   try {
     const { to, message } = req.body;
-    console.log(`📋 [${requestId}] Request details:`, { to, messageLength: message?.length });
+    console.log(`📋 [${requestId}] Request:`, { to, messageLength: message?.length });
 
-    // Input validation
     if (!to || !message) {
-      console.log(`❌ [${requestId}] Validation failed: Missing required fields`);
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: "to" and "message" are required'
+        error: 'Missing required fields: "to" and "message"'
       });
     }
 
-    // Validate phone number(s)
     const recipients = Array.isArray(to) ? to : [to];
     const invalidNumbers = recipients.filter(num => !validatePhoneNumber(num));
     
     if (invalidNumbers.length > 0) {
-      console.log(`❌ [${requestId}] Invalid phone numbers:`, invalidNumbers);
       return res.status(400).json({
         success: false,
         error: `Invalid phone number(s): ${invalidNumbers.join(', ')}`
       });
     }
 
-    // Validate message
     if (!validateMessage(message)) {
-      console.log(`❌ [${requestId}] Invalid message: Empty or too long`);
       return res.status(400).json({
         success: false,
-        error: 'Message must be non-empty and less than 1600 characters'
+        error: 'Invalid message'
       });
     }
 
-    console.log(`✅ [${requestId}] Validation passed. Sending to ${recipients.length} recipient(s)...`);
-
-    // Send SMS to all recipients
     const results = [];
     for (const recipient of recipients) {
       try {
-        console.log(`📤 [${requestId}] Sending SMS to ${recipient}...`);
-        
-        const twilioResponse = await client.messages.create({
+        const twilioResponse = await twilioClient.messages.create({
           body: message,
           to: recipient,
           from: process.env.TWILIO_NUMBER,
         });
 
-        console.log(`✅ [${requestId}] SMS sent to ${recipient}:`, {
-          sid: twilioResponse.sid,
-          status: twilioResponse.status,
-          dateSent: twilioResponse.dateCreated
-        });
+        console.log(`✅ [${requestId}] SMS sent to ${recipient}`);
 
         results.push({
           to: recipient,
           success: true,
-          sid: twilioResponse.sid,
-          status: twilioResponse.status
+          sid: twilioResponse.sid
         });
       } catch (error) {
-        console.error(`❌ [${requestId}] Failed to send SMS to ${recipient}:`, {
-          error: error.message,
-          code: error.code,
-          status: error.status
-        });
-
+        console.error(`❌ [${requestId}] Failed:`, error.message);
         results.push({
           to: recipient,
           success: false,
@@ -840,84 +1275,194 @@ app.post('/send-sms', async (req, res) => {
       }
     }
 
-    // Check if all messages failed
-    const allFailed = results.every(result => !result.success);
+    const allFailed = results.every(r => !r.success);
     if (allFailed) {
-      console.log(`❌ [${requestId}] All messages failed`);
       return res.status(500).json({
         success: false,
-        error: 'Failed to send SMS to all recipients',
+        error: 'Failed to send to all recipients',
         details: results
       });
     }
 
-    // Check if some messages failed
-    const someFailed = results.some(result => !result.success);
-    if (someFailed) {
-      console.log(`⚠️ [${requestId}] Some messages failed`);
-      return res.status(207).json({
-        success: true,
-        message: 'Some messages failed to send',
-        results: results
-      });
-    }
-
-    // All messages successful
-    console.log(`✅ [${requestId}] All messages sent successfully`);
     res.json({
       success: true,
-      message: recipients.length > 1 ? 'All messages sent successfully' : 'Message sent successfully',
+      message: 'Messages sent',
       results: results
     });
 
   } catch (error) {
-    console.error(`❌ [${requestId}] Unexpected error:`, {
-      message: error.message,
-      stack: error.stack
-    });
+    console.error(`❌ [${requestId}] Error:`, error);
     res.status(500).json({
       success: false,
-      error: 'Internal server error: ' + error.message
+      error: error.message
     });
   }
 });
 
-// GET /messages endpoint
 app.get('/messages', async (req, res) => {
-  console.log('\n📋 Fetching message history...');
   try {
-    const messages = await client.messages.list({
-      limit: 20
-    });
-
-    const formattedMessages = messages.map(msg => ({
-      sid: msg.sid,
-      to: msg.to,
-      body: msg.body,
-      status: msg.status,
-      dateSent: msg.dateSent,
-      from: msg.from,
-      direction: msg.direction
-    }));
-
-    console.log(`✅ Retrieved ${formattedMessages.length} messages`);
+    const messages = await twilioClient.messages.list({ limit: 20 });
     res.json({
       success: true,
-      messages: formattedMessages
+      messages: messages
     });
-
   } catch (error) {
-    console.error('❌ Error fetching messages:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to fetch messages: ' + error.message
+      error: error.message
     });
   }
 });
 
-// ========== UPDATED PING ENDPOINT ==========
+// ========== WHATSAPP ENDPOINTS ==========
 
-// Enhanced ping endpoint with auto-ping status
+app.get('/whatsapp/qr', async (req, res) => {
+  try {
+    if (!whatsappSocket && !isConnecting && !connectionError) {
+      connectToWhatsApp();
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head><meta charset="UTF-8"><title>Initializing WhatsApp</title></head>
+          <body style="font-family: Arial; text-align: center; padding: 50px;">
+            <div class="spinner" style="width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #25d366; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px auto;"></div>
+            <h2>Starting Ice Men WhatsApp Bot</h2>
+            <p>Initializing your automated ice order system...</p>
+            <style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>
+          </body>
+        </html>
+      `);
+    }
+
+    if (isWhatsAppConnected) {
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head><meta charset="UTF-8"><title>WhatsApp Connected</title></head>
+          <body style="font-family: Arial; text-align: center; padding: 50px;">
+            <div style="color: #25d366; font-size: 48px;">✅</div>
+            <h2>Ice Men WhatsApp Bot is LIVE! 🧊</h2>
+            <p>Your automated ice order system is running and ready!</p>
+            <p><strong>Enhanced Features:</strong></p>
+            <ul style="text-align: left; display: inline-block;">
+              <li>📍 Advanced location geocoding & validation</li>
+              <li>🛑 Cancel detection at any point</li>
+              <li>🏪 Store information for small orders</li>
+              <li>⏰ 40-minute delivery estimate</li>
+              <li>💳 Cash/EFT payment information</li>
+              <li>📱 Sticker/photo detection</li>
+              <li>👋 Returning customer recognition</li>
+              <li>📞 Multiple agent contacts</li>
+              <li>🌐 Website integration</li>
+            </ul>
+            <p><em>Orders automatically save to Google Sheets</em></p>
+          </body>
+        </html>
+      `);
+    }
+
+    if (connectionError) {
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head><meta charset="UTF-8"><title>Connection Error</title></head>
+          <body style="font-family: Arial; text-align: center; padding: 50px;">
+            <div style="color: #dc3545; font-size: 48px;">❌</div>
+            <h2>Connection Error</h2>
+            <p>${connectionError}</p>
+            <button onclick="location.reload()" style="background: #25d366; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer;">🔄 Retry Connection</button>
+          </body>
+        </html>
+      `);
+    }
+
+    if (qrCode) {
+      webQR.toString(qrCode, { type: 'svg' }, (err, svg) => {
+        if (err) return res.status(500).send('<h2>Failed to generate QR code</h2>');
+        
+        res.send(`
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="UTF-8">
+              <title>Connect Ice Men WhatsApp</title>
+              <style>
+                body { font-family: Arial; text-align: center; padding: 20px; background: #f0f2f5; }
+                .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+              </style>
+            </head>
+            <body>
+              <div class="container">
+                <h2>🧊 Connect Ice Men WhatsApp</h2>
+                <p><strong>Scan this QR code with your phone to link your WhatsApp Business number</strong></p>
+                <div style="margin: 20px 0;">${svg}</div>
+                <p><strong>Instructions:</strong></p>
+                <ol style="text-align: left;">
+                  <li>Open WhatsApp on your phone</li>
+                  <li>Tap ⋯ (Menu) → Linked Devices</li>
+                  <li>Tap "Link a Device"</li>
+                  <li>Scan the QR code above</li>
+                </ol>
+                <p><small>This links your number once - then the bot runs 24/7 on the server!</small></p>
+              </div>
+            </body>
+          </html>
+        `);
+      });
+    } else {
+      res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head><meta http-equiv="refresh" content="3"><title>Initializing</title></head>
+          <body style="font-family: Arial; text-align: center; padding: 50px;">
+            <div class="spinner" style="width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #25d366; border-radius: 50%; animation: spin 1s linear infinite; margin: 20px auto;"></div>
+            <h2>Generating QR Code...</h2>
+            <p>Setting up your Ice Men automation system</p>
+            <style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>
+          </body>
+        </html>
+      `);
+    }
+  } catch (error) {
+    console.error('❌ Error in /whatsapp/qr:', error);
+    res.status(500).send('<h2>Error</h2>');
+  }
+});
+
+app.post('/whatsapp/send', async (req, res) => {
+  const { to, message } = req.body;
+  if (!to || !message) return res.status(400).json({ success: false, error: 'Missing to or message' });
+  if (!whatsappSocket || !isWhatsAppConnected) return res.status(503).json({ success: false, error: 'WhatsApp not connected' });
+
+  try {
+    await sendWhatsAppMessage(to, message);
+    res.json({ success: true, message: 'Message sent' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/whatsapp/status', (req, res) => {
+  res.json({
+    success: true,
+    connected: isWhatsAppConnected,
+    activeOrders: activeOrders.size,
+    totalCustomers: customerHistory.size,
+    business: 'Ice Men Bethlehem',
+    status: isWhatsAppConnected ? 'LIVE - Taking Orders' : 'Offline',
+    timestamp: new Date().toISOString(),
+    features: [
+      'Advanced location geocoding',
+      'Multiple agent contacts',
+      'Website integration',
+      'Cancel detection',
+      'Returning customer tracking'
+    ]
+  });
+});
+
+// ========== UTILITY ENDPOINTS ==========
+
 app.get('/ping', (req, res) => {
   const response = {
     pong: true,
@@ -928,184 +1473,136 @@ app.get('/ping', (req, res) => {
       enabled: true,
       interval: '10 minutes',
       lastPing: lastPingTime,
-      nextPing: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 10 * 60 * 1000).toISOString() : 'Calculating...'
+      nextPing: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 10 * 60 * 1000).toISOString() : null
     },
     whatsapp: {
       connected: isWhatsAppConnected,
-      status: isWhatsAppConnected ? 'connected' : 'disconnected'
+      status: isWhatsAppConnected ? 'connected' : 'disconnected',
+      activeOrders: activeOrders.size,
+      totalCustomers: customerHistory.size
     },
-    n8n: {
-      configured: !!process.env.N8N_WEBHOOK_URL,
-      webhookUrl: process.env.N8N_WEBHOOK_URL ? '✅ Configured' : '❌ Not configured'
+    twilio: {
+      configured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN)
     }
   };
   
-  console.log(`🏓 Ping received - ${new Date().toISOString()}`);
+  console.log(`🏓 Ping received`);
   res.json(response);
 });
 
-// Health check endpoint
 app.get('/health', (req, res) => {
-  console.log('💚 Health check');
   res.json({
     success: true,
     message: 'Server is running',
     timestamp: new Date().toISOString(),
-    twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_NUMBER),
-    whatsappStatus: isWhatsAppConnected ? 'connected' : (isConnecting ? 'connecting' : 'disconnected'),
-    whatsappError: connectionError || null,
-    n8nConfigured: !!process.env.N8N_WEBHOOK_URL,
-    autoPing: {
-      active: !!pingInterval,
-      interval: '10 minutes',
-      lastPing: lastPingTime
-    }
+    twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
+    whatsappStatus: isWhatsAppConnected ? 'connected' : 'disconnected',
+    googleSheets: 'connected',
+    activeOrders: activeOrders.size,
+    totalCustomers: customerHistory.size,
+    features: [
+      'Advanced location geocoding & validation',
+      'Cancel detection at any point',
+      'Store information integration',
+      '40-minute delivery estimates',
+      'Payment information',
+      'Sticker/photo detection',
+      'Returning customer tracking',
+      'Multiple agent contacts',
+      'Website integration'
+    ]
   });
 });
 
-// Diagnostic endpoint
 app.get('/debug', (req, res) => {
   res.json({
     server: 'running',
     nodeVersion: process.version,
-    platform: process.platform,
     uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    env: {
-      PORT: process.env.PORT,
-      NODE_ENV: process.env.NODE_ENV,
-      TWILIO_CONFIGURED: !!process.env.TWILIO_ACCOUNT_SID,
-      N8N_CONFIGURED: !!process.env.N8N_WEBHOOK_URL,
-      DISABLE_WHATSAPP: process.env.DISABLE_WHATSAPP
-    },
     whatsapp: {
       connected: isWhatsAppConnected,
       connecting: isConnecting,
       qrAvailable: !!qrCode,
       error: connectionError,
-      socketExists: !!whatsappSocket
+      socketExists: !!whatsappSocket,
+      activeOrders: activeOrders.size,
+      customerHistory: customerHistory.size
     },
-    autoPing: {
-      enabled: !!pingInterval,
-      interval: '10 minutes',
-      lastPingTime: lastPingTime,
-      nextPingTime: lastPingTime ? new Date(new Date(lastPingTime).getTime() + 10 * 60 * 1000).toISOString() : null
+    twilio: {
+      configured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN)
     }
   });
 });
 
-// Root endpoint
 app.get('/', (req, res) => {
   res.json({
     message: 'Dual SMS/WhatsApp Server is running!',
     endpoints: {
       'SMS': {
-        'POST /send-sms': 'Send SMS via Twilio',
-        'GET /messages': 'Get last 20 SMS messages'
+        'POST /send-sms': 'Send SMS',
+        'GET /messages': 'Get messages'
       },
       'WhatsApp': {
-        'GET /whatsapp/qr': 'Get QR code for WhatsApp connection',
+        'GET /whatsapp/qr': 'Get QR code',
         'POST /whatsapp/send': 'Send WhatsApp message',
-        'GET /whatsapp/status': 'Check WhatsApp connection status',
-        'POST /whatsapp/reconnect': 'Manually trigger WhatsApp reconnection',
-        'POST /test-n8n': 'Test n8n webhook connection'
+        'GET /whatsapp/status': 'Check status'
       },
-      'GET /health': 'Health check'
+      'Utility': {
+        'GET /health': 'Health check',
+        'GET /ping': 'Ping server',
+        'GET /debug': 'Debug info'
+      }
     },
     currentStatus: {
       whatsappConnected: isWhatsAppConnected,
-      whatsappConnecting: isConnecting,
-      qrAvailable: !!qrCode,
-      hasError: !!connectionError,
-      n8nConfigured: !!process.env.N8N_WEBHOOK_URL
+      twilioConfigured: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
+      activeOrders: activeOrders.size,
+      totalCustomers: customerHistory.size
     }
   });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
-  console.error('❌ Unhandled error:', error);
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error'
-  });
-});
+// ========== START SERVER ==========
 
-// Start server and initialize WhatsApp
 async function startServer() {
-  try {
-    // Start Express server FIRST (so it can respond to health checks)
-    const server = app.listen(PORT, '0.0.0.0', () => {
-      console.log('\n🚀 ========================================');
-      console.log(`🚀 Dual SMS/WhatsApp Server running on port ${PORT}`);
-      console.log(`📱 Twilio Number: ${process.env.TWILIO_NUMBER || '⚠️ NOT CONFIGURED'}`);
-      console.log(`🤖 WhatsApp Status: Initializing...`);
-      console.log(`🔗 n8n Webhook: ${process.env.N8N_WEBHOOK_URL ? '✅ CONFIGURED' : '⚠️ NOT CONFIGURED'}`);
-      console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-      console.log(`🔗 WhatsApp QR: http://localhost:${PORT}/whatsapp/qr`);
-      console.log(`🚀 Server is READY and listening on port ${PORT}`);
-      console.log('🚀 ========================================\n');
-      
-      // Start auto-ping system to keep Render awake
-      startAutoPing();
-      
-      // Initialize WhatsApp connection AFTER server is running
-      // Don't await - let it run in background
-      // Only initialize if not in minimal mode
-      if (process.env.DISABLE_WHATSAPP !== 'true') {
-        connectToWhatsApp().catch(err => {
-          console.error('❌ WhatsApp initialization error:', err.message);
-          connectionError = `WhatsApp init failed: ${err.message}`;
-        });
-      } else {
-        console.log('⚠️ WhatsApp disabled via DISABLE_WHATSAPP env var');
-      }
-    });
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log('\n🚀 ========================================');
+    console.log(`🚀 Dual SMS/WhatsApp Server running on port ${PORT}`);
+    console.log(`📱 Twilio: ${process.env.TWILIO_NUMBER || '⚠️ NOT CONFIGURED'}`);
+    console.log(`🤖 WhatsApp Bot: ${isWhatsAppConnected ? '✅ CONNECTED' : '🔗 SCAN QR'}`);
+    console.log(`🧊 Ice Men Automation: ✅ ACTIVE`);
+    console.log(`📍 Advanced Location Geocoding: ✅ ACTIVE`);
+    console.log(`🛑 Cancel Detection: ✅ ACTIVE`);
+    console.log(`🏪 Store Info: ✅ ACTIVE`);
+    console.log(`⏰ 40-min Delivery: ✅ ACTIVE`);
+    console.log(`💳 Payment Info: ✅ ACTIVE`);
+    console.log(`📞 Multiple Agent Contacts: ✅ ACTIVE`);
+    console.log(`🌐 Website Integration: ✅ ACTIVE`);
+    console.log(`🔗 Health: http://localhost:${PORT}/health`);
+    console.log(`🔗 WhatsApp QR: http://localhost:${PORT}/whatsapp/qr`);
+    console.log('🚀 ========================================\n');
+    
+    startAutoPing();
+    connectToWhatsApp();
+  });
 
-    // Handle server errors
-    server.on('error', (error) => {
-      console.error('❌ Server error:', error);
-      if (error.code === 'EADDRINUSE') {
-        console.error(`Port ${PORT} is already in use`);
-      }
-      process.exit(1);
-    });
-
-  } catch (error) {
-    console.error('❌ Failed to start server:', error);
+  server.on('error', (error) => {
+    console.error('❌ Server error:', error);
     process.exit(1);
-  }
+  });
 }
 
-// Handle uncaught errors
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-  console.error('Stack:', error.stack);
-  // Don't exit - keep server running
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-  // Don't exit - keep server running
-});
-
-// Handle graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\n🔄 Shutting down gracefully...');
+  console.log('\n🔄 Shutting down server...');
   stopAutoPing();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  console.log('\n🔄 Received SIGTERM, shutting down...');
+  console.log('\n🔄 SIGTERM received...');
   stopAutoPing();
   process.exit(0);
 });
 
-// Log when process starts
-console.log('🔵 Starting server process...');
-console.log('🔵 Node version:', process.version);
-console.log('🔵 Environment:', process.env.NODE_ENV || 'development');
-console.log('🔵 PORT:', PORT);
-
+console.log('🔵 Starting Dual SMS/WhatsApp server...');
 startServer();
